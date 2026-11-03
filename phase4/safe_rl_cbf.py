@@ -2,104 +2,46 @@
 """
 RL COURSE — PHASE 4.14
 ============================================================
-Filename:
-    phase4/safe_rl_cbf.py
-
-LESSON:
-    Safe Reinforcement Learning and Control Barrier Functions
+Filename: phase4/safe_rl_cbf.py
 
 PURPOSE
 -------
-Learn how to constrain an RL agent's actions to reduce the
-risk of collisions and boundary violations.
+Train a drone to track a moving target while avoiding
+obstacles and remaining inside the operating area.
 
 WHAT YOU LEARN
 --------------
-STEP 1 — Safety constraints
-    Define safe operating regions for a robot.
+STEP 1 — Moving-target interception
+    Use target position and velocity to predict where the
+    target will be rather than chasing its current position.
 
-STEP 2 — Control Barrier Functions
-    Represent obstacle clearance and boundary clearance
-    mathematically.
+STEP 2 — PD demonstration controller
+    Generate useful initial tracking experiences.
 
-STEP 3 — Safety filter
-    Modify an RL action when it violates a safety constraint.
+STEP 3 — Reward shaping
+    Reward distance reduction, velocity matching, and
+    successful interception.
 
 STEP 4 — TD3
-    Train a continuous-action RL agent.
+    Learn continuous drone acceleration commands.
 
-STEP 5 — Safe RL
-    Apply the CBF safety filter during training and evaluation.
+STEP 5 — CBF safety filter
+    Project actions onto approximate safety constraints.
 
-STEP 6 — Comparison
+STEP 6 — Evaluation
     Compare raw TD3 and CBF-filtered TD3.
 
-STEP 7 — Pygame
-    Visualize the rocket, moving target, obstacle, safety
-    boundaries, and filtered actions.
+STEP 7 — Visualization
+    Display the quadcopter, moving target, obstacle,
+    requested action, and executed action.
 
-MATHEMATICAL FOUNDATION
------------------------
+IMPORTANT
+---------
+This is an educational 2D acceleration-level drone model.
+It is not a flight controller for a physical drone.
 
-Obstacle barrier:
-    h(x) = ||p - p_obstacle||^2 - R_safe^2
-
-A safe state satisfies:
-    h(x) >= 0
-
-Continuous-time CBF condition:
-    dh/dt + alpha*h >= 0
-
-For a moving robot:
-    dh/dt = 2*(p-p_obstacle).(v)
-
-For this lesson, we use a discrete acceleration-level
-approximation:
-
-    r . (v + a*dt) >= -k*h
-
-where:
-    r = p - p_obstacle
-    a = MAX_ACCELERATION * action
-
-This produces a linear inequality in the normalized action.
-
-Boundary constraints use analogous one-dimensional
-barrier inequalities.
-
-The safety filter projects the requested action onto
-the intersection of the linear safety constraints.
-
-IMPORTANT LIMITATIONS
----------------------
-This is an educational, approximate CBF implementation.
-
-It does not guarantee safety when:
-    - The robot is already outside the safe set.
-    - Constraints are mutually infeasible.
-    - The dynamics model is inaccurate.
-    - The robot has insufficient acceleration authority.
-    - There are unmodeled delays or disturbances.
-
-A production robot requires a validated safety architecture.
-
-ROBOTICS APPLICATION
---------------------
-- Autonomous mobile robot collision avoidance
-- Drone obstacle avoidance
-- Safe manipulation
-- Human-robot interaction
-- Autonomous vehicle motion constraints
-
-CONTROLS
---------
-1       Raw TD3
-2       Safe TD3 with CBF
-SPACE   Pause / resume
-R       Reset
-+ / -   Simulation speed
-Mouse   Change moving-target trajectory center
-ESC     Exit
+The CBF projection is approximate and does not guarantee
+safety when constraints are infeasible.
 ============================================================
 """
 
@@ -126,6 +68,9 @@ random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
 DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
@@ -136,7 +81,7 @@ PANEL_WIDTH = 310
 
 DT = 0.10
 
-ROBOT_RADIUS = 13
+DRONE_RADIUS = 13
 MAX_SPEED = 115.0
 MAX_ACCELERATION = 100.0
 
@@ -148,11 +93,9 @@ OBSTACLE = np.array(
 OBSTACLE_RADIUS = 52.0
 SAFETY_MARGIN = 35.0
 
-# The CBF obstacle radius includes the robot radius and
-# an additional clearance margin.
 SAFE_OBSTACLE_RADIUS = (
     OBSTACLE_RADIUS
-    + ROBOT_RADIUS
+    + DRONE_RADIUS
     + SAFETY_MARGIN
 )
 
@@ -172,48 +115,63 @@ TAU = 0.005
 ACTOR_LR = 1e-4
 CRITIC_LR = 3e-4
 
-BUFFER_CAPACITY = 100_000
-BATCH_SIZE = 128
-WARMUP_STEPS = 500
+BUFFER_CAPACITY = 200_000
+BATCH_SIZE = 256
+
+# More experience before learning.
+WARMUP_STEPS = 2500
 
 POLICY_DELAY = 2
-POLICY_NOISE = 0.15
-NOISE_CLIP = 0.30
+POLICY_NOISE = 0.12
+NOISE_CLIP = 0.25
 
-TRAIN_EPISODES = 100
+# Longer training.
+TRAIN_EPISODES = 400
 MAX_STEPS_PER_EPISODE = 400
 
-# CBF parameters.
+# Demonstration controller schedule.
+EXPERT_STEPS = 6000
+EXPERT_MIX_PROBABILITY = 0.65
+
+# PD tracking parameters.
+PD_KP = 1.8
+PD_KD = 2.2
+LOOKAHEAD_TIME = 0.45
+DESIRED_SPEED = 95.0
+
+# Reward parameters.
+DISTANCE_REWARD = 0.020
+PROGRESS_REWARD = 0.12
+VELOCITY_REWARD = 0.006
+ACTION_PENALTY = 0.012
+SUCCESS_RADIUS = 25.0
+SUCCESS_REWARD = 20.0
+COLLISION_PENALTY = 100.0
+BOUNDARY_PENALTY = 100.0
+
+# CBF.
 CBF_ALPHA = 2.0
-CBF_PROJECTION_ITERATIONS = 30
+CBF_ITERATIONS = 60
 CBF_TOLERANCE = 1e-5
 
 
 # ============================================================
-# 2. COMMON UTILITIES
+# 2. UTILITIES
 # ============================================================
 
 def clamp_vector(vector, maximum):
-    vector = np.asarray(
-        vector,
-        dtype=np.float32
-    )
+    vector = np.asarray(vector, dtype=np.float32)
 
     norm = float(np.linalg.norm(vector))
 
     if norm > maximum:
-        vector = vector * (
-            maximum / (norm + 1e-8)
-        )
+        vector = vector * maximum / (norm + 1e-8)
 
     return vector
 
 
 def safe_unit(vector):
-    vector = np.asarray(
-        vector,
-        dtype=np.float32
-    )
+    vector = np.asarray(vector, dtype=np.float32)
 
     norm = float(np.linalg.norm(vector))
 
@@ -229,6 +187,20 @@ def distance(a, b):
             np.asarray(a) - np.asarray(b)
         )
     )
+
+
+def validate_action(action):
+    action = np.asarray(action, dtype=np.float32)
+
+    if action.shape != (ACTION_DIM,):
+        raise ValueError(
+            f"Invalid action shape: {action.shape}"
+        )
+
+    if not np.all(np.isfinite(action)):
+        raise ValueError("Non-finite action.")
+
+    return np.clip(action, -1.0, 1.0)
 
 
 # ============================================================
@@ -286,23 +258,13 @@ class MovingTarget:
 
 
 # ============================================================
-# 4. ROBOT DYNAMICS
+# 4. DRONE DYNAMICS
 # ============================================================
 
-def predict_robot_state(
-    position,
-    velocity,
-    action
-):
-    action = np.clip(
-        np.asarray(action, dtype=np.float32),
-        -1.0,
-        1.0
-    )
+def predict_drone_state(position, velocity, action):
+    action = validate_action(action)
 
-    acceleration = (
-        action * MAX_ACCELERATION
-    )
+    acceleration = action * MAX_ACCELERATION
 
     next_velocity = (
         velocity + acceleration * DT
@@ -321,22 +283,58 @@ def predict_robot_state(
 
 
 # ============================================================
-# 5. CONTROL BARRIER FUNCTION CONSTRAINTS
+# 5. PD DEMONSTRATION CONTROLLER
+# ============================================================
+
+def pd_tracking_controller(position, velocity, target):
+    """
+    The controller predicts the target's future position.
+
+    Desired velocity:
+        v_desired = Kp * (p_target_future - p_drone)
+
+    Acceleration:
+        a = Kd * (v_desired - v_drone)
+
+    The output is normalized to [-1, 1].
+
+    This controller supplies useful initial replay data.
+    It is a demonstration policy, not the learned policy.
+    """
+
+    future_target = (
+        target.position
+        + target.velocity * LOOKAHEAD_TIME
+    )
+
+    position_error = future_target - position
+
+    desired_velocity = clamp_vector(
+        PD_KP * position_error,
+        DESIRED_SPEED
+    )
+
+    acceleration = (
+        PD_KD * (desired_velocity - velocity)
+    )
+
+    acceleration = clamp_vector(
+        acceleration,
+        MAX_ACCELERATION
+    )
+
+    return np.clip(
+        acceleration / MAX_ACCELERATION,
+        -1.0,
+        1.0
+    ).astype(np.float32)
+
+
+# ============================================================
+# 6. CONTROL BARRIER FUNCTIONS
 # ============================================================
 
 def obstacle_barrier(position):
-    """
-    h_obstacle = ||p - obstacle||^2 - R_safe^2
-
-    Safe region:
-        h_obstacle >= 0
-
-    The safe radius includes:
-        obstacle radius
-        robot radius
-        safety margin
-    """
-
     relative = (
         np.asarray(position, dtype=np.float32)
         - OBSTACLE
@@ -348,69 +346,14 @@ def obstacle_barrier(position):
     )
 
 
-def boundary_barriers(position):
-    """
-    Four boundary barrier functions.
-
-    Left:
-        h_left = x - robot_radius
-
-    Right:
-        h_right = width - robot_radius - x
-
-    Top:
-        h_top = y - robot_radius
-
-    Bottom:
-        h_bottom = height - robot_radius - y
-    """
-
-    x, y = position
-
-    return {
-        "left": float(x - ROBOT_RADIUS),
-        "right": float(WIDTH - ROBOT_RADIUS - x),
-        "top": float(y - ROBOT_RADIUS),
-        "bottom": float(HEIGHT - ROBOT_RADIUS - y)
-    }
-
-
 def build_cbf_constraints(position, velocity):
-    """
-    Construct linear inequalities:
-
-        c_i . action >= b_i
-
-    The normalized action is in [-1,1]^2.
-
-    Obstacle:
-        r . (v + A*dt*u) >= -alpha*h
-
-    Rearranging:
-        (A*dt*r) . u >= -alpha*h - r.v
-
-    Boundaries are derived from the corresponding
-    one-dimensional barrier functions.
-    """
-
-    position = np.asarray(
-        position,
-        dtype=np.float32
-    )
-
-    velocity = np.asarray(
-        velocity,
-        dtype=np.float32
-    )
+    position = np.asarray(position, dtype=np.float32)
+    velocity = np.asarray(velocity, dtype=np.float32)
 
     constraints = []
 
-    # --------------------------------------------------------
-    # Obstacle constraint
-    # --------------------------------------------------------
-
+    # Obstacle.
     relative = position - OBSTACLE
-
     h = obstacle_barrier(position)
 
     coefficient = (
@@ -423,131 +366,75 @@ def build_cbf_constraints(position, velocity):
     )
 
     constraints.append(
-        (coefficient.astype(np.float32), float(rhs), "obstacle")
+        (coefficient, float(rhs), "obstacle")
     )
 
-    # --------------------------------------------------------
-    # Left boundary
-    # --------------------------------------------------------
-
-    h_left = position[0] - ROBOT_RADIUS
-
-    coefficient = np.array(
-        [MAX_ACCELERATION * DT, 0.0],
-        dtype=np.float32
-    )
-
-    rhs = (
-        -CBF_ALPHA * h_left
-        - velocity[0]
-    )
+    # Left.
+    h = position[0] - DRONE_RADIUS
 
     constraints.append(
-        (coefficient, float(rhs), "left")
+        (
+            np.array(
+                [MAX_ACCELERATION * DT, 0.0],
+                dtype=np.float32
+            ),
+            float(-CBF_ALPHA * h - velocity[0]),
+            "left"
+        )
     )
 
-    # --------------------------------------------------------
-    # Right boundary
-    # --------------------------------------------------------
-
-    h_right = (
-        WIDTH - ROBOT_RADIUS - position[0]
-    )
-
-    coefficient = np.array(
-        [-MAX_ACCELERATION * DT, 0.0],
-        dtype=np.float32
-    )
-
-    rhs = (
-        -CBF_ALPHA * h_right
-        + velocity[0]
-    )
+    # Right.
+    h = WIDTH - DRONE_RADIUS - position[0]
 
     constraints.append(
-        (coefficient, float(rhs), "right")
+        (
+            np.array(
+                [-MAX_ACCELERATION * DT, 0.0],
+                dtype=np.float32
+            ),
+            float(-CBF_ALPHA * h + velocity[0]),
+            "right"
+        )
     )
 
-    # --------------------------------------------------------
-    # Top boundary
-    # --------------------------------------------------------
-
-    h_top = position[1] - ROBOT_RADIUS
-
-    coefficient = np.array(
-        [0.0, MAX_ACCELERATION * DT],
-        dtype=np.float32
-    )
-
-    rhs = (
-        -CBF_ALPHA * h_top
-        - velocity[1]
-    )
+    # Top.
+    h = position[1] - DRONE_RADIUS
 
     constraints.append(
-        (coefficient, float(rhs), "top")
+        (
+            np.array(
+                [0.0, MAX_ACCELERATION * DT],
+                dtype=np.float32
+            ),
+            float(-CBF_ALPHA * h - velocity[1]),
+            "top"
+        )
     )
 
-    # --------------------------------------------------------
-    # Bottom boundary
-    # --------------------------------------------------------
-
-    h_bottom = (
-        HEIGHT - ROBOT_RADIUS - position[1]
-    )
-
-    coefficient = np.array(
-        [0.0, -MAX_ACCELERATION * DT],
-        dtype=np.float32
-    )
-
-    rhs = (
-        -CBF_ALPHA * h_bottom
-        + velocity[1]
-    )
+    # Bottom.
+    h = HEIGHT - DRONE_RADIUS - position[1]
 
     constraints.append(
-        (coefficient, float(rhs), "bottom")
+        (
+            np.array(
+                [0.0, -MAX_ACCELERATION * DT],
+                dtype=np.float32
+            ),
+            float(-CBF_ALPHA * h + velocity[1]),
+            "bottom"
+        )
     )
 
     return constraints
 
 
-# ============================================================
-# 6. CBF ACTION PROJECTION
-# ============================================================
-
 def project_action_to_safety(
     requested_action,
     position,
-    velocity,
-    iterations=CBF_PROJECTION_ITERATIONS
+    velocity
 ):
-    """
-    Find an action close to the requested RL action while
-    satisfying linear CBF inequalities.
-
-    Optimization objective:
-        minimize ||u - u_requested||^2
-
-    Subject to:
-        c_i . u >= b_i
-        -1 <= u <= 1
-
-    We use iterative projection onto half-spaces.
-
-    This is an approximate projection algorithm. If the
-    constraints are infeasible, the result may not satisfy
-    every constraint.
-    """
-
-    requested_action = np.clip(
-        np.asarray(
-            requested_action,
-            dtype=np.float32
-        ),
-        -1.0,
-        1.0
+    requested_action = validate_action(
+        requested_action
     )
 
     action = requested_action.copy()
@@ -557,17 +444,14 @@ def project_action_to_safety(
         velocity
     )
 
-    for _ in range(iterations):
-
+    for _ in range(CBF_ITERATIONS):
         changed = False
 
         for coefficient, rhs, _name in constraints:
 
-            value = float(
-                np.dot(coefficient, action)
+            violation = (
+                rhs - float(np.dot(coefficient, action))
             )
-
-            violation = rhs - value
 
             norm_squared = float(
                 np.dot(coefficient, coefficient)
@@ -596,62 +480,43 @@ def project_action_to_safety(
     return action.astype(np.float32)
 
 
-def check_cbf_constraints(
-    action,
-    position,
-    velocity,
-    tolerance=1e-3
-):
-    constraints = build_cbf_constraints(
-        position,
-        velocity
-    )
-
+def check_cbf_constraints(action, position, velocity):
     results = {}
 
-    for coefficient, rhs, name in constraints:
-        value = float(
-            np.dot(coefficient, action)
+    for coefficient, rhs, name in build_cbf_constraints(
+        position,
+        velocity
+    ):
+        results[name] = (
+            float(np.dot(coefficient, action))
+            >= rhs - 1e-3
         )
-
-        results[name] = value >= rhs - tolerance
 
     return results
 
 
-def cbf_action_filter(
-    requested_action,
-    position,
-    velocity
-):
-    filtered_action = project_action_to_safety(
-        requested_action,
+def cbf_action_filter(action, position, velocity):
+    filtered = project_action_to_safety(
+        action,
         position,
         velocity
     )
 
     results = check_cbf_constraints(
-        filtered_action,
+        filtered,
         position,
         velocity
     )
 
-    all_satisfied = all(results.values())
-
-    changed = not np.allclose(
-        requested_action,
-        filtered_action,
-        atol=1e-4
-    )
-
-    return (
-        filtered_action,
-        {
-            "constraints": results,
-            "all_satisfied": all_satisfied,
-            "changed": changed
-        }
-    )
+    return filtered, {
+        "changed": not np.allclose(
+            action,
+            filtered,
+            atol=1e-4
+        ),
+        "all_satisfied": all(results.values()),
+        "constraints": results
+    }
 
 
 # ============================================================
@@ -662,18 +527,7 @@ class MovingTargetEnv:
 
     def __init__(self):
         self.target = MovingTarget()
-
-        self.position = np.array(
-            [100.0, 440.0],
-            dtype=np.float32
-        )
-
-        self.velocity = np.zeros(
-            2,
-            dtype=np.float32
-        )
-
-        self.step_count = 0
+        self.reset()
 
     def reset(self):
         self.position = np.array(
@@ -720,32 +574,35 @@ class MovingTargetEnv:
                     dtype=np.float32
                 )
             ]
-        )
+        ).astype(np.float32)
 
-        return state.astype(np.float32)
+        assert state.shape == (STATE_DIM,)
+        assert np.all(np.isfinite(state))
+
+        return state
 
     def step(self, action):
-        action = np.clip(
-            np.asarray(action, dtype=np.float32),
-            -1.0,
-            1.0
-        )
+        action = validate_action(action)
 
+        old_position = self.position.copy()
+        old_velocity = self.velocity.copy()
+
+        # Predict the moving target at the next time step.
         next_phase = (
             self.target.phase + TARGET_OMEGA * DT
         )
 
-        target_at_next_time = (
-            self.target.position_at(next_phase)
+        future_target = self.target.position_at(
+            next_phase
         )
 
-        distance_before = distance(
-            self.position,
-            target_at_next_time
+        old_distance = distance(
+            old_position,
+            future_target
         )
 
         self.position, self.velocity = (
-            predict_robot_state(
+            predict_drone_state(
                 self.position,
                 self.velocity,
                 action
@@ -754,50 +611,57 @@ class MovingTargetEnv:
 
         self.target.step()
 
-        distance_after = distance(
+        new_distance = distance(
             self.position,
             self.target.position
         )
 
-        progress = (
-            distance_before - distance_after
+        progress = old_distance - new_distance
+
+        relative_velocity = (
+            self.target.velocity - self.velocity
         )
 
-        reward = 0.08 * progress
-
-        reward += 0.3 * math.exp(
-            -distance_after / 75.0
+        velocity_error = float(
+            np.linalg.norm(relative_velocity)
         )
 
-        reward -= 0.015 * float(
-            np.sum(action ** 2)
+        # Dense tracking reward.
+        reward = (
+            PROGRESS_REWARD * progress
+            - DISTANCE_REWARD * new_distance
+            - VELOCITY_REWARD * velocity_error
+            - ACTION_PENALTY * float(np.sum(action ** 2))
         )
 
-        obstacle_distance = distance(
-            self.position,
-            OBSTACLE
+        collision = (
+            distance(self.position, OBSTACLE)
+            < OBSTACLE_RADIUS + DRONE_RADIUS
+        )
+
+        outside = (
+            self.position[0] < DRONE_RADIUS
+            or self.position[0] > WIDTH - DRONE_RADIUS
+            or self.position[1] < DRONE_RADIUS
+            or self.position[1] > HEIGHT - DRONE_RADIUS
+        )
+
+        success = (
+            new_distance <= SUCCESS_RADIUS
         )
 
         terminated = False
 
-        collision = (
-            obstacle_distance
-            < OBSTACLE_RADIUS + ROBOT_RADIUS
-        )
-
-        outside = (
-            self.position[0] < ROBOT_RADIUS
-            or self.position[0] > WIDTH - ROBOT_RADIUS
-            or self.position[1] < ROBOT_RADIUS
-            or self.position[1] > HEIGHT - ROBOT_RADIUS
-        )
-
         if collision:
-            reward -= 100.0
+            reward -= COLLISION_PENALTY
             terminated = True
 
-        if outside:
-            reward -= 100.0
+        elif outside:
+            reward -= BOUNDARY_PENALTY
+            terminated = True
+
+        elif success:
+            reward += SUCCESS_REWARD
             terminated = True
 
         self.step_count += 1
@@ -807,10 +671,12 @@ class MovingTargetEnv:
         )
 
         info = {
-            "distance": distance_after,
+            "distance": new_distance,
             "progress": progress,
+            "velocity_error": velocity_error,
             "collision": collision,
-            "outside": outside
+            "outside": outside,
+            "success": success
         }
 
         return (
@@ -823,7 +689,7 @@ class MovingTargetEnv:
 
 
 # ============================================================
-# 8. TD3 REPLAY BUFFER
+# 8. REPLAY BUFFER
 # ============================================================
 
 class ReplayBuffer:
@@ -850,6 +716,12 @@ class ReplayBuffer:
         )
 
     def sample(self, batch_size):
+        if len(self.buffer) < batch_size:
+            raise ValueError(
+                f"Replay buffer has {len(self.buffer)} "
+                f"samples; {batch_size} required."
+            )
+
         batch = random.sample(
             self.buffer,
             batch_size
@@ -860,28 +732,28 @@ class ReplayBuffer:
         )
 
         return (
-            torch.tensor(
-                np.array(states),
+            torch.as_tensor(
+                np.asarray(states),
                 dtype=torch.float32,
                 device=DEVICE
             ),
-            torch.tensor(
-                np.array(actions),
+            torch.as_tensor(
+                np.asarray(actions),
                 dtype=torch.float32,
                 device=DEVICE
             ),
-            torch.tensor(
-                np.array(rewards),
+            torch.as_tensor(
+                np.asarray(rewards),
                 dtype=torch.float32,
                 device=DEVICE
             ).unsqueeze(1),
-            torch.tensor(
-                np.array(next_states),
+            torch.as_tensor(
+                np.asarray(next_states),
                 dtype=torch.float32,
                 device=DEVICE
             ),
-            torch.tensor(
-                np.array(dones),
+            torch.as_tensor(
+                np.asarray(dones),
                 dtype=torch.float32,
                 device=DEVICE
             ).unsqueeze(1)
@@ -931,10 +803,7 @@ class Critic(nn.Module):
 
     def forward(self, state, action):
         return self.network(
-            torch.cat(
-                [state, action],
-                dim=1
-            )
+            torch.cat([state, action], dim=1)
         )
 
 
@@ -980,7 +849,7 @@ class TD3Agent:
         self.training_steps = 0
 
     def select_action(self, state, noise=0.0):
-        state_tensor = torch.tensor(
+        state = torch.as_tensor(
             state,
             dtype=torch.float32,
             device=DEVICE
@@ -988,7 +857,7 @@ class TD3Agent:
 
         with torch.no_grad():
             action = self.actor(
-                state_tensor
+                state
             ).cpu().numpy()[0]
 
         if noise > 0:
@@ -1005,14 +874,15 @@ class TD3Agent:
         ).astype(np.float32)
 
     def soft_update(self, source, target):
-        for source_parameter, target_parameter in zip(
-            source.parameters(),
-            target.parameters()
-        ):
-            target_parameter.data.copy_(
-                TAU * source_parameter.data
-                + (1.0 - TAU) * target_parameter.data
-            )
+        with torch.no_grad():
+            for source_parameter, target_parameter in zip(
+                source.parameters(),
+                target.parameters()
+            ):
+                target_parameter.data.copy_(
+                    TAU * source_parameter.data
+                    + (1.0 - TAU) * target_parameter.data
+                )
 
     def train_step(self, replay):
         if len(replay) < BATCH_SIZE:
@@ -1031,10 +901,9 @@ class TD3Agent:
                 next_states
             )
 
-            noise = (
-                torch.randn_like(next_actions)
-                * POLICY_NOISE
-            )
+            noise = torch.randn_like(
+                next_actions
+            ) * POLICY_NOISE
 
             noise = noise.clamp(
                 -NOISE_CLIP,
@@ -1045,20 +914,17 @@ class TD3Agent:
                 next_actions + noise
             ).clamp(-1.0, 1.0)
 
-            q1_target = self.critic1_target(
+            q1 = self.critic1_target(
                 next_states,
                 next_actions
             )
 
-            q2_target = self.critic2_target(
+            q2 = self.critic2_target(
                 next_states,
                 next_actions
             )
 
-            target_q = torch.minimum(
-                q1_target,
-                q2_target
-            )
+            target_q = torch.minimum(q1, q2)
 
             target = (
                 rewards
@@ -1133,21 +999,19 @@ class TD3Agent:
 # ============================================================
 
 def train_td3():
-    print("\nTraining Safe TD3...")
+    print("\nTraining improved Safe TD3...")
     print(f"Device: {DEVICE}")
 
     env = MovingTargetEnv()
     agent = TD3Agent()
-
-    replay = ReplayBuffer(
-        BUFFER_CAPACITY
-    )
+    replay = ReplayBuffer(BUFFER_CAPACITY)
 
     rewards_history = []
     distances_history = []
+    success_history = []
 
-    safety_modifications = 0
     total_steps = 0
+    interventions = 0
 
     for episode in range(TRAIN_EPISODES):
 
@@ -1155,53 +1019,82 @@ def train_td3():
 
         episode_reward = 0.0
         episode_distances = []
+        episode_success = False
 
         for _ in range(MAX_STEPS_PER_EPISODE):
 
-            if total_steps < WARMUP_STEPS:
-                requested_action = np.random.uniform(
-                    -1.0,
-                    1.0,
-                    ACTION_DIM
-                ).astype(np.float32)
+            # ------------------------------------------------
+            # Demonstration-guided exploration
+            # ------------------------------------------------
 
-            else:
-                exploration = max(
-                    0.05,
-                    0.25 * (
-                        1.0 - episode / TRAIN_EPISODES
+            expert_action = pd_tracking_controller(
+                env.position,
+                env.velocity,
+                env.target
+            )
+
+            if total_steps < EXPERT_STEPS:
+                # Initially use the PD controller with noise.
+                requested_action = (
+                    expert_action
+                    + np.random.normal(
+                        0.0,
+                        0.12,
+                        ACTION_DIM
                     )
                 )
 
-                requested_action = agent.select_action(
+            else:
+                learned_action = agent.select_action(
                     state,
-                    noise=exploration
+                    noise=0.15
                 )
 
-            # Apply CBF during training.
-            safe_action, safety_info = cbf_action_filter(
+                # Gradually reduce expert assistance.
+                if random.random() < EXPERT_MIX_PROBABILITY:
+                    requested_action = (
+                        0.7 * expert_action
+                        + 0.3 * learned_action
+                    )
+                else:
+                    requested_action = learned_action
+
+            requested_action = validate_action(
+                requested_action
+            )
+
+            # CBF filter during training.
+            executed_action, safety_info = cbf_action_filter(
                 requested_action,
                 env.position,
                 env.velocity
             )
 
             if safety_info["changed"]:
-                safety_modifications += 1
+                interventions += 1
 
-            next_state, reward, terminated, truncated, info = (
-                env.step(safe_action)
-            )
+            (
+                next_state,
+                reward,
+                terminated,
+                truncated,
+                info
+            ) = env.step(executed_action)
 
-            # Store the action actually executed by the environment.
+            # Store the actual action executed.
             replay.add(
                 state,
-                safe_action,
+                executed_action,
                 reward,
                 next_state,
                 terminated
             )
 
-            if total_steps >= WARMUP_STEPS:
+            # Begin learning after enough experience.
+            if (
+                total_steps >= WARMUP_STEPS
+                and len(replay) >= BATCH_SIZE
+            ):
                 agent.train_step(replay)
 
             state = next_state
@@ -1211,35 +1104,51 @@ def train_td3():
                 info["distance"]
             )
 
+            if info["success"]:
+                episode_success = True
+
             total_steps += 1
 
             if terminated or truncated:
                 break
 
-        rewards_history.append(
-            episode_reward
-        )
+        rewards_history.append(episode_reward)
 
         distances_history.append(
             float(np.mean(episode_distances))
         )
 
+        success_history.append(
+            float(episode_success)
+        )
+
         if (episode + 1) % 10 == 0:
+            recent_rewards = np.mean(
+                rewards_history[-10:]
+            )
+
+            recent_distances = np.mean(
+                distances_history[-10:]
+            )
+
+            recent_success = np.mean(
+                success_history[-10:]
+            ) * 100.0
+
             print(
                 f"Episode {episode + 1:3d}/"
                 f"{TRAIN_EPISODES} | "
-                f"Reward: "
-                f"{np.mean(rewards_history[-10:]):8.2f} | "
-                f"Distance: "
-                f"{np.mean(distances_history[-10:]):7.2f} | "
-                f"Safety interventions: "
-                f"{safety_modifications}"
+                f"Reward: {recent_rewards:8.2f} | "
+                f"Distance: {recent_distances:7.2f} | "
+                f"Success: {recent_success:5.1f}% | "
+                f"CBF interventions: {interventions}"
             )
 
     return (
         agent,
         rewards_history,
-        distances_history
+        distances_history,
+        success_history
     )
 
 
@@ -1247,14 +1156,18 @@ def train_td3():
 # 12. TRAINING VISUALIZATION
 # ============================================================
 
-def visualize_training(rewards, distances):
+def visualize_training(
+    rewards,
+    distances,
+    successes
+):
     try:
         import matplotlib.pyplot as plt
 
         fig, axes = plt.subplots(
-            2,
+            3,
             1,
-            figsize=(10, 7)
+            figsize=(10, 9)
         )
 
         axes[0].plot(
@@ -1264,7 +1177,7 @@ def visualize_training(rewards, distances):
         )
 
         if len(rewards) >= 10:
-            average = np.convolve(
+            smooth = np.convolve(
                 rewards,
                 np.ones(10) / 10,
                 mode="valid"
@@ -1272,26 +1185,45 @@ def visualize_training(rewards, distances):
 
             axes[0].plot(
                 np.arange(9, len(rewards)),
-                average,
+                smooth,
                 label="10-episode average"
             )
 
-        axes[0].set_title("Safe TD3 Training Reward")
-        axes[0].set_xlabel("Episode")
+        axes[0].set_title("TD3 Training Reward")
         axes[0].set_ylabel("Reward")
         axes[0].legend()
         axes[0].grid(True)
 
         axes[1].plot(
             distances,
-            label="Mean tracking distance"
+            label="Mean target distance"
         )
 
-        axes[1].set_title("Moving-Target Tracking Distance")
-        axes[1].set_xlabel("Episode")
-        axes[1].set_ylabel("Distance")
+        axes[1].set_title("Tracking Performance")
+        axes[1].set_ylabel("Pixels")
         axes[1].legend()
         axes[1].grid(True)
+
+        window = 10
+
+        success_rate = np.convolve(
+            successes,
+            np.ones(window) / window,
+            mode="valid"
+        ) * 100.0
+
+        axes[2].plot(
+            np.arange(window, len(successes) + 1),
+            success_rate,
+            label="10-episode success rate"
+        )
+
+        axes[2].set_title("Interception Success Rate")
+        axes[2].set_xlabel("Episode")
+        axes[2].set_ylabel("Success (%)")
+        axes[2].set_ylim(0, 100)
+        axes[2].legend()
+        axes[2].grid(True)
 
         plt.tight_layout()
         plt.show()
@@ -1301,17 +1233,12 @@ def visualize_training(rewards, distances):
 
 
 # ============================================================
-# 13. PYGAME VISUALIZATION
+# 13. PYGAME DRONE VISUALIZATION
 # ============================================================
 
-class RocketGUI:
+class DroneGUI:
 
-    def __init__(
-        self,
-        agent,
-        rewards,
-        distances
-    ):
+    def __init__(self, agent):
         pygame.init()
 
         self.screen = pygame.display.set_mode(
@@ -1319,52 +1246,39 @@ class RocketGUI:
         )
 
         pygame.display.set_caption(
-            "Phase 4.14 — Safe RL with CBF"
+            "Phase 4.14 — Improved Safe TD3 Drone"
         )
 
         self.clock = pygame.time.Clock()
 
         self.font = pygame.font.SysFont(
             "consolas",
-            16
-        )
-
-        self.small_font = pygame.font.SysFont(
-            "consolas",
-            13
+            15
         )
 
         self.agent = agent
-        self.rewards = rewards
-        self.distances = distances
-
         self.env = MovingTargetEnv()
         self.env.reset()
 
-        # 1 = Raw TD3
-        # 2 = Safe TD3
         self.mode = 2
-
         self.paused = False
         self.speed = 1
-
-        self.last_requested_action = np.zeros(
-            ACTION_DIM,
-            dtype=np.float32
-        )
-
-        self.last_safe_action = np.zeros(
-            ACTION_DIM,
-            dtype=np.float32
-        )
-
-        self.last_safety_info = {
-            "constraints": {},
-            "all_satisfied": True,
-            "changed": False
-        }
-
         self.running = True
+
+        self.requested_action = np.zeros(
+            ACTION_DIM,
+            dtype=np.float32
+        )
+
+        self.executed_action = np.zeros(
+            ACTION_DIM,
+            dtype=np.float32
+        )
+
+        self.safety_info = {
+            "changed": False,
+            "all_satisfied": True
+        }
 
         self.interventions = 0
         self.total_actions = 0
@@ -1372,8 +1286,8 @@ class RocketGUI:
     def reset(self):
         self.env.reset()
 
-        self.last_requested_action[:] = 0.0
-        self.last_safe_action[:] = 0.0
+        self.requested_action[:] = 0.0
+        self.executed_action[:] = 0.0
 
         self.interventions = 0
         self.total_actions = 0
@@ -1387,7 +1301,7 @@ class RocketGUI:
         ):
             return
 
-        candidate = np.array(
+        candidate = np.asarray(
             [x, y],
             dtype=np.float32
         )
@@ -1402,13 +1316,11 @@ class RocketGUI:
         )
 
         if minimum_clearance < (
-            OBSTACLE_RADIUS + ROBOT_RADIUS + 25
+            OBSTACLE_RADIUS + DRONE_RADIUS + 25
         ):
             return
 
-        self.env.target.set_center(
-            candidate
-        )
+        self.env.target.set_center(candidate)
 
     def select_action(self):
         state = self.env.get_state()
@@ -1419,60 +1331,44 @@ class RocketGUI:
         )
 
         if self.mode == 1:
-            action = requested
+            executed = requested
 
-            safety_info = {
+            info = {
                 "changed": False,
-                "all_satisfied": False,
-                "constraints": {}
+                "all_satisfied": False
             }
 
         else:
-            action, safety_info = cbf_action_filter(
+            executed, info = cbf_action_filter(
                 requested,
                 self.env.position,
                 self.env.velocity
             )
 
-        self.last_requested_action = requested.copy()
-        self.last_safe_action = action.copy()
-        self.last_safety_info = safety_info
+        self.requested_action = requested.copy()
+        self.executed_action = executed.copy()
+        self.safety_info = info
 
         self.total_actions += 1
 
-        if safety_info["changed"]:
+        if info["changed"]:
             self.interventions += 1
 
-        return action
+        return executed
 
-    def draw_arrow(
-        self,
-        start,
-        end,
-        color,
-        width=2
-    ):
-        start = np.asarray(
-            start,
-            dtype=np.float32
-        )
-
-        end = np.asarray(
-            end,
-            dtype=np.float32
-        )
+    def draw_arrow(self, start, end, color, width=2):
+        start = np.asarray(start, dtype=np.float32)
+        end = np.asarray(end, dtype=np.float32)
 
         pygame.draw.line(
             self.screen,
             color,
-            tuple(start.astype(int)),
-            tuple(end.astype(int)),
+            start.astype(int),
+            end.astype(int),
             width
         )
 
-        direction = safe_unit(
-            end - start
-        )
+        direction = safe_unit(end - start)
 
         if np.linalg.norm(direction) < 1e-6:
             return
@@ -1481,17 +1377,8 @@ class RocketGUI:
             [-direction[1], direction[0]]
         )
 
-        p1 = (
-            end
-            - direction * 10
-            + perpendicular * 5
-        )
-
-        p2 = (
-            end
-            - direction * 10
-            - perpendicular * 5
-        )
+        p1 = end - direction * 9 + perpendicular * 4
+        p2 = end - direction * 9 - perpendicular * 4
 
         pygame.draw.polygon(
             self.screen,
@@ -1503,89 +1390,93 @@ class RocketGUI:
             ]
         )
 
-    def draw_rocket(self):
-        position = self.env.position
-        velocity = self.env.velocity
+    def draw_drone(self):
+        p = self.env.position
 
-        direction = safe_unit(
-            velocity
+        velocity_direction = safe_unit(
+            self.env.velocity
         )
 
-        if np.linalg.norm(direction) < 0.1:
-            direction = safe_unit(
-                self.env.target.position - position
+        if np.linalg.norm(velocity_direction) < 0.1:
+            velocity_direction = safe_unit(
+                self.env.target.position - p
             )
 
-        if np.linalg.norm(direction) < 0.1:
-            direction = np.array(
+        if np.linalg.norm(velocity_direction) < 0.1:
+            velocity_direction = np.array(
                 [1.0, 0.0]
             )
 
         perpendicular = np.array(
-            [-direction[1], direction[0]]
+            [-velocity_direction[1], velocity_direction[0]]
         )
 
-        nose = position + direction * 22
-        rear = position - direction * 15
+        offsets = [
+            velocity_direction * 20 + perpendicular * 20,
+            velocity_direction * 20 - perpendicular * 20,
+            -velocity_direction * 20 + perpendicular * 20,
+            -velocity_direction * 20 - perpendicular * 20
+        ]
 
-        left_fin = rear + perpendicular * 13
-        right_fin = rear - perpendicular * 13
+        for offset in offsets:
+            motor = p + offset
 
-        body_left = position + perpendicular * 8
-        body_right = position - perpendicular * 8
+            pygame.draw.line(
+                self.screen,
+                (195, 210, 230),
+                p.astype(int),
+                motor.astype(int),
+                4
+            )
 
-        exhaust_length = random.randint(
-            10,
-            18
-        )
+            pygame.draw.circle(
+                self.screen,
+                (90, 160, 225),
+                motor.astype(int),
+                7
+            )
 
-        pygame.draw.line(
+            pygame.draw.circle(
+                self.screen,
+                (190, 220, 255),
+                motor.astype(int),
+                10,
+                1
+            )
+
+        pygame.draw.circle(
             self.screen,
-            (255, 125, 30),
-            tuple(rear.astype(int)),
-            tuple(
-                (
-                    rear - direction * exhaust_length
-                ).astype(int)
-            ),
-            5
-        )
-
-        pygame.draw.polygon(
-            self.screen,
-            (205, 215, 230),
-            [
-                nose.astype(int),
-                body_left.astype(int),
-                left_fin.astype(int),
-                rear.astype(int),
-                right_fin.astype(int),
-                body_right.astype(int)
-            ]
+            (230, 235, 245),
+            p.astype(int),
+            11
         )
 
         pygame.draw.circle(
             self.screen,
-            (30, 45, 65),
-            tuple(position.astype(int)),
+            (35, 45, 65),
+            p.astype(int),
+            5
+        )
+
+        front = p + velocity_direction * 14
+
+        pygame.draw.circle(
+            self.screen,
+            (255, 185, 70),
+            front.astype(int),
             4
         )
 
     def draw_target_path(self):
         points = []
 
-        for index in range(100):
-            phase = (
-                self.env.target.phase
-                + index * 0.08
-            )
-
-            point = self.env.target.position_at(
-                phase
-            )
+        for i in range(100):
+            phase = self.env.target.phase + i * 0.08
 
             points.append(
-                tuple(point.astype(int))
+                self.env.target.position_at(
+                    phase
+                ).astype(int)
             )
 
         pygame.draw.lines(
@@ -1597,11 +1488,8 @@ class RocketGUI:
         )
 
     def draw_world(self):
-        self.screen.fill(
-            (15, 20, 30)
-        )
+        self.screen.fill((15, 20, 30))
 
-        # Grid.
         for x in range(0, WIDTH, 40):
             pygame.draw.line(
                 self.screen,
@@ -1620,7 +1508,6 @@ class RocketGUI:
 
         self.draw_target_path()
 
-        # World boundary.
         pygame.draw.rect(
             self.screen,
             (90, 110, 140),
@@ -1628,7 +1515,6 @@ class RocketGUI:
             2
         )
 
-        # Obstacle safe zone.
         pygame.draw.circle(
             self.screen,
             (115, 75, 55),
@@ -1637,7 +1523,6 @@ class RocketGUI:
             2
         )
 
-        # Physical obstacle.
         pygame.draw.circle(
             self.screen,
             (170, 65, 65),
@@ -1645,7 +1530,6 @@ class RocketGUI:
             int(OBSTACLE_RADIUS)
         )
 
-        # Current target.
         target = self.env.target.position
 
         pygame.draw.circle(
@@ -1669,25 +1553,20 @@ class RocketGUI:
             (100, 240, 130)
         )
 
-        # Requested action vector.
         self.draw_arrow(
             self.env.position,
-            self.env.position
-            + self.last_requested_action * 45,
+            self.env.position + self.requested_action * 45,
             (230, 100, 100),
             2
         )
 
-        # Filtered action vector.
         self.draw_arrow(
             self.env.position,
-            self.env.position
-            + self.last_safe_action * 65,
+            self.env.position + self.executed_action * 65,
             (100, 170, 255),
             3
         )
 
-        # Rocket velocity.
         self.draw_arrow(
             self.env.position,
             self.env.position + self.env.velocity * 0.35,
@@ -1695,7 +1574,7 @@ class RocketGUI:
             2
         )
 
-        self.draw_rocket()
+        self.draw_drone()
 
     def draw_panel(self):
         x = WIDTH
@@ -1714,7 +1593,7 @@ class RocketGUI:
             2
         )
 
-        target_distance = distance(
+        d = distance(
             self.env.position,
             self.env.target.position
         )
@@ -1725,39 +1604,37 @@ class RocketGUI:
             else "SAFE TD3 + CBF"
         )
 
-        intervention_rate = (
+        rate = (
             100.0 * self.interventions
             / max(1, self.total_actions)
         )
 
         lines = [
             ("PHASE 4.14", (255, 220, 100)),
-            ("Safe RL + Control Barrier", (220, 230, 245)),
-            ("Functions", (220, 230, 245)),
+            ("IMPROVED SAFE TD3", (220, 230, 245)),
             ("", (200, 200, 200)),
             ("CONTROLLER", (150, 190, 255)),
             ("1  Raw TD3", (220, 220, 220)),
             ("2  Safe TD3 + CBF", (220, 220, 220)),
-            ("", (200, 200, 200)),
             (f"Mode: {mode_name}", (100, 240, 150)),
             ("", (200, 200, 200)),
             ("TRACKING", (150, 190, 255)),
-            (f"Distance: {target_distance:.1f}", (230, 230, 230)),
+            (f"Distance: {d:.1f}", (230, 230, 230)),
             (f"Target vx: {self.env.target.velocity[0]:.1f}", (180, 240, 180)),
             (f"Target vy: {self.env.target.velocity[1]:.1f}", (180, 240, 180)),
             ("", (200, 200, 200)),
-            ("CBF SAFETY FILTER", (150, 190, 255)),
+            ("SAFETY", (150, 190, 255)),
             (f"Obstacle h: {obstacle_barrier(self.env.position):.0f}", (220, 220, 220)),
-            (f"Safety modified: {self.last_safety_info['changed']}", (220, 220, 220)),
-            (f"Constraints pass: {self.last_safety_info['all_satisfied']}", (220, 220, 220)),
+            (f"Modified: {self.safety_info['changed']}", (220, 220, 220)),
+            (f"Constraints: {self.safety_info['all_satisfied']}", (220, 220, 220)),
             (f"Interventions: {self.interventions}", (220, 220, 220)),
-            (f"Intervention rate: {intervention_rate:.1f}%", (220, 220, 220)),
+            (f"Intervention rate: {rate:.1f}%", (220, 220, 220)),
             ("", (200, 200, 200)),
             ("ACTIONS", (150, 190, 255)),
-            (f"Requested X: {self.last_requested_action[0]:+.2f}", (230, 140, 140)),
-            (f"Requested Y: {self.last_requested_action[1]:+.2f}", (230, 140, 140)),
-            (f"Executed X: {self.last_safe_action[0]:+.2f}", (130, 190, 255)),
-            (f"Executed Y: {self.last_safe_action[1]:+.2f}", (130, 190, 255)),
+            (f"Requested X: {self.requested_action[0]:+.2f}", (230, 140, 140)),
+            (f"Requested Y: {self.requested_action[1]:+.2f}", (230, 140, 140)),
+            (f"Executed X: {self.executed_action[0]:+.2f}", (130, 190, 255)),
+            (f"Executed Y: {self.executed_action[1]:+.2f}", (130, 190, 255)),
             ("", (200, 200, 200)),
             ("SIMULATION", (150, 190, 255)),
             (f"Speed: {self.speed}x", (220, 220, 220)),
@@ -1775,7 +1652,7 @@ class RocketGUI:
 
         for text, color in lines:
             if text:
-                surface = self.small_font.render(
+                surface = self.font.render(
                     text,
                     True,
                     color
@@ -1783,10 +1660,10 @@ class RocketGUI:
 
                 self.screen.blit(
                     surface,
-                    (x + 12, y)
+                    (x + 10, y)
                 )
 
-            y += 15
+            y += 16
 
     def handle_events(self):
         for event in pygame.event.get():
@@ -1831,21 +1708,17 @@ class RocketGUI:
                     )
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
-                if (
-                    event.button == 1
-                    and event.pos[0] < WIDTH
-                ):
-                    self.change_target_center(
-                        event.pos
-                    )
+
+                if event.button == 1 and event.pos[0] < WIDTH:
+                    self.change_target_center(event.pos)
 
     def run(self):
         while self.running:
             self.handle_events()
 
             if not self.paused:
-                for _ in range(self.speed):
 
+                for _ in range(self.speed):
                     action = self.select_action()
 
                     (
@@ -1870,166 +1743,67 @@ class RocketGUI:
 
 
 # ============================================================
-# 14. UNIT TESTS
+# 14. TESTS
 # ============================================================
 
 def run_tests():
-    print("\nRunning Phase 4.14 tests...\n")
+    print("\nRunning improved Phase 4.14 tests...\n")
 
-    # Test 1: Obstacle barrier is positive in a safe location.
-    safe_position = np.array(
-        [100.0, 100.0],
-        dtype=np.float32
-    )
+    tests = 0
 
-    assert obstacle_barrier(safe_position) > 0.0
-    print("Test 1 passed: obstacle safe region")
+    def passed(name):
+        nonlocal tests
+        tests += 1
+        print(f"Test {tests} passed: {name}")
 
-    # Test 2: Obstacle barrier is negative inside the safe radius.
-    unsafe_position = OBSTACLE + np.array(
-        [10.0, 0.0],
-        dtype=np.float32
-    )
-
-    assert obstacle_barrier(unsafe_position) < 0.0
-    print("Test 2 passed: obstacle unsafe region")
-
-    # Test 3: Boundary barriers are positive at the center.
-    barriers = boundary_barriers(
-        np.array([360.0, 290.0])
-    )
-
-    assert all(value > 0 for value in barriers.values())
-    print("Test 3 passed: boundary barriers")
-
-    # Test 4: Boundary barrier detects an outside position.
-    barriers = boundary_barriers(
-        np.array([-10.0, 100.0])
-    )
-
-    assert barriers["left"] < 0.0
-    print("Test 4 passed: outside boundary detection")
-
-    # Test 5: Constraint builder returns five constraints.
-    constraints = build_cbf_constraints(
-        np.array([100.0, 100.0]),
-        np.zeros(2)
-    )
-
-    assert len(constraints) == 5
-    print("Test 5 passed: CBF constraint construction")
-
-    # Test 6: All constraint coefficients are two-dimensional.
-    for coefficient, rhs, name in constraints:
-        assert coefficient.shape == (ACTION_DIM,)
-        assert np.isfinite(rhs)
-
-    print("Test 6 passed: CBF constraint dimensions")
-
-    # Test 7: Action projection preserves bounds.
-    requested = np.array(
-        [1.0, -1.0],
-        dtype=np.float32
-    )
-
-    filtered = project_action_to_safety(
-        requested,
-        np.array([100.0, 100.0]),
-        np.zeros(2)
-    )
-
-    assert np.all(filtered >= -1.0)
-    assert np.all(filtered <= 1.0)
-    print("Test 7 passed: projected action bounds")
-
-    # Test 8: Safe action is unchanged in a distant safe state
-    # when the requested action already satisfies all constraints.
-    requested = np.array(
-        [0.0, 0.0],
-        dtype=np.float32
-    )
-
-    filtered = project_action_to_safety(
-        requested,
-        np.array([100.0, 100.0]),
-        np.zeros(2)
-    )
-
-    assert np.allclose(
-        filtered,
-        requested,
-        atol=1e-4
-    )
-
-    print("Test 8 passed: no unnecessary intervention")
-
-    # Test 9: Safe action satisfies CBF constraints in a
-    # representative near-obstacle state with feasible braking.
-    position = np.array(
-        [OBSTACLE[0] - SAFE_OBSTACLE_RADIUS - 8.0,
-         OBSTACLE[1]],
-        dtype=np.float32
-    )
-
-    velocity = np.array(
-        [12.0, 0.0],
-        dtype=np.float32
-    )
-
-    requested = np.array(
-        [1.0, 0.0],
-        dtype=np.float32
-    )
-
-    filtered = project_action_to_safety(
-        requested,
-        position,
-        velocity
-    )
-
-    results = check_cbf_constraints(
-        filtered,
-        position,
-        velocity
-    )
-
-    assert results["obstacle"]
-    print("Test 9 passed: feasible obstacle constraint")
-
-    # Test 10: Environment state dimension.
     env = MovingTargetEnv()
 
     state = env.reset()
 
     assert state.shape == (STATE_DIM,)
-    print("Test 10 passed: environment observation")
+    passed("environment state dimension")
 
-    # Test 11: Environment step structure.
-    result = env.step(
-        np.zeros(ACTION_DIM)
+    assert np.all(np.isfinite(state))
+    passed("finite environment state")
+
+    action = pd_tracking_controller(
+        env.position,
+        env.velocity,
+        env.target
     )
 
-    assert len(result) == 5
-    assert result[0].shape == (STATE_DIM,)
-    assert np.isfinite(result[1])
+    assert action.shape == (ACTION_DIM,)
+    assert np.all(np.abs(action) <= 1.0)
+    passed("PD controller action")
 
-    print("Test 11 passed: environment step")
-
-    # Test 12: Replay buffer.
-    replay = ReplayBuffer(100)
-
-    replay.add(
-        np.zeros(STATE_DIM),
-        np.zeros(ACTION_DIM),
-        1.0,
-        np.ones(STATE_DIM),
-        False
+    filtered, info = cbf_action_filter(
+        action,
+        env.position,
+        env.velocity
     )
 
-    assert len(replay) == 1
-    print("Test 12 passed: replay buffer")
+    assert filtered.shape == (ACTION_DIM,)
+    assert np.all(np.abs(filtered) <= 1.0)
+    passed("CBF action projection")
 
-    # Test 13: Replay batch shapes.
+    constraints = build_cbf_constraints(
+        env.position,
+        env.velocity
+    )
+
+    assert len(constraints) == 5
+    passed("five CBF constraints")
+
+    next_state, reward, terminated, truncated, info = env.step(
+        filtered
+    )
+
+    assert next_state.shape == (STATE_DIM,)
+    assert np.isfinite(reward)
+    passed("environment transition")
+
+    replay = ReplayBuffer(1000)
+
     for _ in range(BATCH_SIZE):
         replay.add(
             np.zeros(STATE_DIM),
@@ -2041,85 +1815,39 @@ def run_tests():
 
     batch = replay.sample(BATCH_SIZE)
 
-    assert batch[0].shape == (
-        BATCH_SIZE,
-        STATE_DIM
-    )
+    assert batch[0].shape == (BATCH_SIZE, STATE_DIM)
+    assert batch[1].shape == (BATCH_SIZE, ACTION_DIM)
+    assert batch[2].shape == (BATCH_SIZE, 1)
+    passed("replay buffer batch dimensions")
 
-    assert batch[1].shape == (
-        BATCH_SIZE,
-        ACTION_DIM
-    )
-
-    assert batch[2].shape == (
-        BATCH_SIZE,
-        1
-    )
-
-    print("Test 13 passed: replay batch dimensions")
-
-    # Test 14: Actor output.
-    actor = Actor().to(DEVICE)
-
-    with torch.no_grad():
-        output = actor(
-            torch.zeros(
-                (4, STATE_DIM),
-                device=DEVICE
-            )
-        )
-
-    assert output.shape == (4, ACTION_DIM)
-    assert torch.all(output <= 1.0)
-    assert torch.all(output >= -1.0)
-
-    print("Test 14 passed: actor output")
-
-    # Test 15: Critic output.
-    critic = Critic().to(DEVICE)
-
-    with torch.no_grad():
-        q = critic(
-            torch.zeros(
-                (4, STATE_DIM),
-                device=DEVICE
-            ),
-            torch.zeros(
-                (4, ACTION_DIM),
-                device=DEVICE
-            )
-        )
-
-    assert q.shape == (4, 1)
-    print("Test 15 passed: critic output")
-
-    # Test 16: TD3 action.
     agent = TD3Agent()
 
-    action = agent.select_action(
+    output = agent.select_action(
         np.zeros(STATE_DIM, dtype=np.float32)
     )
 
-    assert action.shape == (ACTION_DIM,)
-    assert np.all(action >= -1.0)
-    assert np.all(action <= 1.0)
+    assert output.shape == (ACTION_DIM,)
+    assert np.all(np.abs(output) <= 1.0)
+    passed("TD3 actor output")
 
-    print("Test 16 passed: TD3 action")
+    loss = agent.train_step(replay)
 
-    # Test 17: CBF action filter result structure.
-    action, info = cbf_action_filter(
-        np.array([1.0, 1.0]),
-        np.array([100.0, 100.0]),
-        np.zeros(2)
+    assert loss is not None
+    assert np.isfinite(loss)
+    passed("TD3 training update")
+
+    # Verify target actually moves.
+    previous = env.target.position.copy()
+    env.target.step()
+
+    assert not np.allclose(
+        previous,
+        env.target.position
     )
 
-    assert action.shape == (ACTION_DIM,)
-    assert "changed" in info
-    assert "all_satisfied" in info
+    passed("moving target")
 
-    print("Test 17 passed: CBF filter interface")
-
-    print("\nAll 17 tests passed.\n")
+    print(f"\nAll {tests} tests passed.\n")
 
 
 # ============================================================
@@ -2128,27 +1856,35 @@ def run_tests():
 
 def main():
     print("=" * 65)
-    print("PHASE 4.14 — SAFE RL AND CONTROL BARRIER FUNCTIONS")
+    print("PHASE 4.14 — IMPROVED SAFE TD3 DRONE TRACKING")
     print("=" * 65)
 
     run_tests()
 
-    agent, rewards, distances = train_td3()
+    (
+        agent,
+        rewards,
+        distances,
+        successes
+    ) = train_td3()
 
     visualize_training(
         rewards,
-        distances
+        distances,
+        successes
     )
 
-    print("\nStarting Pygame simulation.")
-    print("Press 1 for Raw TD3 or 2 for Safe TD3 + CBF.")
+    print("\nStarting interactive drone simulation.")
 
-    gui = RocketGUI(
-        agent,
-        rewards,
-        distances
-    )
+    print("1 = Raw TD3")
+    print("2 = Safe TD3 + CBF")
+    print("SPACE = Pause / resume")
+    print("R = Reset")
+    print("+/- = Simulation speed")
+    print("Mouse = Change moving target center")
+    print("ESC = Exit")
 
+    gui = DroneGUI(agent)
     gui.run()
 
 

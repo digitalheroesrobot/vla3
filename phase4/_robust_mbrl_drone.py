@@ -1,96 +1,75 @@
-
 """
 File: phase4/robust_mbrl_drone.py
 
-PHASE 4.20 — ROBUST MODEL-BASED RL
-===================================
+PHASE 4.20 — ROBUST MODEL-BASED RL (REVISED AND CORRECTED)
 
 PURPOSE
 -------
-Train dynamics models under randomized physical conditions and use
-them to plan drone motion that remains effective under model mismatch
-and external disturbances.
+Train an ensemble of drone dynamics models across continuously randomized
+physics, then use robust model-predictive control (MPC) to intercept a
+moving target while avoiding an obstacle.
 
 WHAT YOU LEARN
 --------------
 
-STEP 1 — Domain randomization
-    Train with different:
-        - drone mass
-        - aerodynamic drag
-        - acceleration effectiveness
-        - wind conditions
+STEP 1 — Diverse dynamics data
+    Randomize mass, drag, acceleration effectiveness, wind, initial state,
+    and action sequences. Mix tracking, random, and temporally smooth actions.
 
-STEP 2 — Disturbance modeling
-    Represent wind as part of the observed state.
-    Learn how wind affects the drone's velocity and position.
+STEP 2 — Episode-level validation
+    Keep complete episodes out of training.
 
-STEP 3 — Domain-specific dynamics models
-    Train an ensemble where each model represents a different
-    randomized physical domain.
+STEP 3 — Bootstrapped dynamics ensemble
+    Train independent models on bootstrapped episode samples.
+    Bootstrap duplicates are preserved.
 
 STEP 4 — Robust MPC
-    Evaluate candidate action sequences across all models.
-    Optimize a risk-sensitive cost:
-        J_robust = mean(J) + risk_weight * std(J)
-                    + worst_case_weight * max(J)
+    Evaluate candidate action sequences across:
+      - multiple randomized physical domains
+      - multiple independently propagated learned ensemble members
 
-STEP 5 — Sim-to-real-style evaluation
-    Test under:
-        - nominal domain
-        - unseen mass and drag
-        - strong wind
-        - combined parameter variation and disturbances
+STEP 5 — CEM action-sequence optimization
+    Iteratively sample temporally correlated action sequences.
 
-STEP 6 — Compare controllers
-    PD controller
-    Nominal-model MPC
-    Robust ensemble MPC
-    Oracle MPC
+STEP 6 — Moving-target interception
+    Include target position and velocity in every MPC prediction step.
 
-STEP 7 — Visualize and verify
-    Training loss, controller metrics, robustness under different
-    test conditions, and interactive quadcopter visualization.
+STEP 7 — Predictive obstacle avoidance
+    Include obstacle clearance in planning and apply a heuristic
+    velocity-aware safety filter.
+
+STEP 8 — Paired evaluation
+    Compare PD, nominal MPC, robust ensemble MPC, and oracle MPC.
+
+STEP 9 — Interactive visualization
+    Display the drone, moving target, obstacle, planned trajectory,
+    and ensemble disagreement.
+
+IMPORTANT LIMITATIONS
+---------------------
+This is a simplified 2D simulation, not flight-certified software.
+Ensemble disagreement is not a calibrated probability distribution.
+The obstacle filter does not guarantee collision avoidance.
 
 INSTALL
 -------
-    pip install numpy torch matplotlib pygame
+pip install numpy torch matplotlib pygame
 
 RUN
 ---
-    python phase4/robust_mbrl_drone.py
+python robust_mbrl_drone.py
 
 CONTROLS
 --------
-    1 : PD controller
-    2 : Nominal MPC
-    3 : Robust Ensemble MPC
-    4 : Oracle MPC
-    SPACE : Pause/resume
-    R : Reset drone
-    + / - : Simulation speed
-    Left mouse click : Change moving-target trajectory center
-    ESC : Exit
-
-ROBOTICS APPLICATION
---------------------
-A real drone may experience changing payload, battery voltage,
-air density, wind, and motor performance.
-
-Domain randomization exposes the learning system to a range of
-conditions. Robust MPC then evaluates a candidate action under
-multiple plausible dynamics models before choosing an action.
-
-IMPORTANT LIMITATIONS
---------------------
-1. This is a simplified 2D drone simulation.
-2. The domain ensemble represents plausible physical domains;
-   it is not a calibrated probability distribution.
-3. Future wind prediction is approximate.
-4. The robust cost is a heuristic, not a formal safety guarantee.
-5. Oracle MPC knows the simulator's physical parameters and is
-   an idealized reference, not a real-world controller.
-6. This is not flight-certified software.
+1: PD
+2: Nominal MPC
+3: Robust Ensemble MPC
+4: Oracle MPC
+SPACE: Pause
+R: Reset
++/-: Simulation speed
+Mouse click: Move target trajectory center
+ESC: Exit
 """
 
 from __future__ import annotations
@@ -116,93 +95,129 @@ random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-DEVICE = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
-)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 WORLD_W = 900
 WORLD_H = 650
-
 DT = 0.08
 
 MAX_SPEED = 155.0
 MAX_ACCEL = 125.0
 DRONE_RADIUS = 13.0
 
-OBSTACLE = np.array(
-    [450.0, 330.0],
-    dtype=np.float32,
-)
-
+OBSTACLE = np.array([450.0, 330.0], dtype=np.float32)
 OBSTACLE_RADIUS = 65.0
-SAFE_RADIUS = 100.0
+SAFE_RADIUS = 115.0
 
-TARGET_A = 170.0
-TARGET_B = 105.0
-TARGET_OMEGA = 0.55
-
-# Domain-specific dynamics.
-# Mass multiplier: larger means less acceleration.
-# Drag: velocity damping coefficient.
-# Acceleration multiplier: motor effectiveness.
-
-DOMAINS = [
-    {
-        "name": "light_low_drag",
-        "mass": 0.80,
-        "drag": 0.035,
-        "accel": 1.15,
-    },
-    {
-        "name": "light_high_drag",
-        "mass": 0.85,
-        "drag": 0.105,
-        "accel": 1.10,
-    },
-    {
-        "name": "nominal",
-        "mass": 1.00,
-        "drag": 0.065,
-        "accel": 1.00,
-    },
-    {
-        "name": "heavy_low_drag",
-        "mass": 1.25,
-        "drag": 0.040,
-        "accel": 0.88,
-    },
-    {
-        "name": "heavy_high_drag",
-        "mass": 1.30,
-        "drag": 0.115,
-        "accel": 0.85,
-    },
-]
-
-MODEL_COUNT = len(DOMAINS)
-
-HIDDEN = 128
-EPOCHS = 65
-BATCH_SIZE = 256
-LEARNING_RATE = 1e-3
-
-DATA_EPISODES_PER_DOMAIN = 28
-DATA_STEPS_PER_EPISODE = 130
-
-MPC_HORIZON = 12
-MPC_CANDIDATES = 64
-
-ACTION_NOISE = 0.48
-
-ROBUST_RISK_WEIGHT = 1.4
-ROBUST_WORST_WEIGHT = 0.35
+TARGET_A = 145.0
+TARGET_B = 85.0
+TARGET_OMEGA = 0.42
 
 WIND_DECAY = 0.88
 WIND_NOISE_TRAIN = 13.0
 WIND_NOISE_TEST = 18.0
 
-BENCHMARK_EPISODES = 3
+MASS_RANGE = (0.70, 1.50)
+DRAG_RANGE = (0.02, 0.16)
+ACCEL_RANGE = (0.72, 1.28)
+
+# Data and model training.
+DATA_EPISODES = 120
+STEPS_PER_EPISODE = 250
+
+MODEL_COUNT = 5
+HIDDEN = 192
+EPOCHS = 45
+BATCH_SIZE = 512
+LEARNING_RATE = 7e-4
+WEIGHT_DECAY = 1e-5
+
+# MPC/CEM.
+MPC_HORIZON = 18
+
+CEM_CANDIDATES = 96
+CEM_ELITES = 12
+CEM_ITERATIONS = 4
+
+CEM_INITIAL_STD = 0.55
+CEM_MIN_STD = 0.10
+CEM_SMOOTHING = 0.65
+
+# Robust objective:
+# J = mean(J) + risk_weight*std(J) + worst_weight*max(J)
+
+ROBUST_RISK_WEIGHT = 0.55
+ROBUST_WORST_WEIGHT = 0.25
+
+# Cost weights.
+W_DISTANCE = 0.045
+W_VELOCITY = 0.018
+W_OBSTACLE = 0.12
+W_BOUNDARY = 0.08
+W_ACTION = 0.018
+W_ACTION_CHANGE = 0.025
+W_TERMINAL_DISTANCE = 0.16
+W_TERMINAL_VELOCITY = 0.06
+
+BENCHMARK_EPISODES = 6
 BENCHMARK_STEPS = 200
+
+INPUT_SIZE = 11
+OUTPUT_SIZE = 6
+
+MODES = [
+    "PD",
+    "Nominal MPC",
+    "Robust Ensemble MPC",
+    "Oracle MPC",
+]
+
+NOMINAL_DOMAIN = {
+    "name": "nominal",
+    "mass": 1.0,
+    "drag": 0.065,
+    "accel": 1.0,
+}
+
+TRAIN_DOMAINS = [
+    NOMINAL_DOMAIN,
+    {"name": "light", "mass": 0.78, "drag": 0.045, "accel": 1.18},
+    {"name": "heavy", "mass": 1.40, "drag": 0.105, "accel": 0.78},
+    {"name": "strong_drag", "mass": 1.10, "drag": 0.15, "accel": 0.92},
+    {"name": "combined_shift", "mass": 1.35, "drag": 0.135, "accel": 0.80},
+]
+
+
+def random_domain(name="randomized"):
+    return {
+        "name": name,
+        "mass": float(np.random.uniform(*MASS_RANGE)),
+        "drag": float(np.random.uniform(*DRAG_RANGE)),
+        "accel": float(np.random.uniform(*ACCEL_RANGE)),
+    }
+
+
+def unseen_test_domains():
+    return [
+        {"name": "unseen_light", "mass": 0.72, "drag": 0.055, "accel": 1.20},
+        {"name": "unseen_heavy", "mass": 1.46, "drag": 0.095, "accel": 0.75},
+        {"name": "unseen_drag", "mass": 1.10, "drag": 0.155, "accel": 0.90},
+        {"name": "unseen_combined", "mass": 1.40, "drag": 0.145, "accel": 0.76},
+    ]
+
+
+def domain_vector(domain):
+    return np.array(
+        [
+            domain["mass"],
+            domain["drag"],
+            domain["accel"],
+        ],
+        dtype=np.float32,
+    )
 
 
 # ============================================================
@@ -217,11 +232,7 @@ class MovingTarget:
 
     def position(self, phase=None):
 
-        p = (
-            self.phase
-            if phase is None
-            else phase
-        )
+        p = self.phase if phase is None else phase
 
         return self.center + np.array(
             [
@@ -233,11 +244,7 @@ class MovingTarget:
 
     def velocity(self, phase=None):
 
-        p = (
-            self.phase
-            if phase is None
-            else phase
-        )
+        p = self.phase if phase is None else phase
 
         return np.array(
             [
@@ -249,81 +256,27 @@ class MovingTarget:
 
     def advance(self):
 
-        self.phase += TARGET_OMEGA * DT
+        self.phase = (
+            self.phase + TARGET_OMEGA * DT
+        ) % (2.0 * math.pi)
 
 
-def target_at(target, future_step):
+def target_at(target, step):
 
-    phase = (
-        target.phase
-        + TARGET_OMEGA * DT * future_step
-    )
+    phase = target.phase + TARGET_OMEGA * DT * step
 
     return target.position(phase)
 
 
-def target_velocity_at(target, future_step):
+def target_velocity_at(target, step):
 
-    phase = (
-        target.phase
-        + TARGET_OMEGA * DT * future_step
-    )
+    phase = target.phase + TARGET_OMEGA * DT * step
 
     return target.velocity(phase)
 
 
 # ============================================================
-# 2. DOMAIN RANDOMIZATION
-# ============================================================
-
-def random_domain():
-
-    return {
-        "name": "randomized",
-        "mass": float(
-            np.random.uniform(0.75, 1.40)
-        ),
-        "drag": float(
-            np.random.uniform(0.025, 0.13)
-        ),
-        "accel": float(
-            np.random.uniform(0.78, 1.22)
-        ),
-    }
-
-
-def unseen_test_domains():
-
-    return [
-        {
-            "name": "unseen_light",
-            "mass": 0.72,
-            "drag": 0.055,
-            "accel": 1.20,
-        },
-        {
-            "name": "unseen_heavy",
-            "mass": 1.42,
-            "drag": 0.095,
-            "accel": 0.78,
-        },
-        {
-            "name": "strong_drag",
-            "mass": 1.10,
-            "drag": 0.145,
-            "accel": 0.92,
-        },
-        {
-            "name": "combined_shift",
-            "mass": 1.36,
-            "drag": 0.13,
-            "accel": 0.80,
-        },
-    ]
-
-
-# ============================================================
-# 3. DRONE ENVIRONMENT WITH WIND
+# 2. DRONE ENVIRONMENT
 # ============================================================
 
 class DroneEnv:
@@ -335,66 +288,51 @@ class DroneEnv:
     Action:
         [ax_normalized, ay_normalized]
 
-    Simplified dynamics:
-        v_next = v + (
-            action * MAX_ACCEL * accel / mass
-            - drag * v
-            + wind
-        ) * dt
+    Physical acceleration:
+        a = action * MAX_ACCEL * accel / mass - drag*v + wind
 
-        p_next = p + v_next * dt
+    Integration:
+        v_next = v + a*DT
+        p_next = p + v_next*DT
 
-    Wind follows an approximate autoregressive process:
-        wind_next = WIND_DECAY * wind + random_noise
-
-    The model receives current wind as an input.
+    Wind:
+        wind_next = WIND_DECAY*wind + Gaussian disturbance
     """
 
-    def __init__(
-        self,
-        domain=None,
-        wind_noise=WIND_NOISE_TRAIN,
-    ):
+    def __init__(self, domain=None, wind_noise=WIND_NOISE_TRAIN):
 
-        self.domain = (
-            random_domain()
-            if domain is None
-            else dict(domain)
-        )
+        self.domain = dict(domain or random_domain())
 
         self.wind_noise = float(wind_noise)
 
         self.target = MovingTarget(
-            np.array(
-                [700.0, 310.0],
-                dtype=np.float32,
-            )
+            np.array([710.0, 300.0], dtype=np.float32)
         )
 
         self.reset()
 
-    def reset(self):
+    def reset(self, seed=None):
+
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+        else:
+            self.rng = np.random.default_rng()
 
         self.position = np.array(
-            [115.0, 500.0],
+            [125.0, 500.0],
             dtype=np.float32,
         )
 
-        self.velocity = np.zeros(
-            2, dtype=np.float32
-        )
+        self.velocity = np.zeros(2, dtype=np.float32)
 
-        self.wind = np.random.normal(
+        self.wind = self.rng.normal(
             0.0,
             8.0,
             size=2,
         ).astype(np.float32)
 
         self.target.phase = float(
-            np.random.uniform(
-                0.0,
-                2.0 * math.pi,
-            )
+            self.rng.uniform(0.0, 2.0 * math.pi)
         )
 
         return self.state()
@@ -411,44 +349,32 @@ class DroneEnv:
 
     def step_drone(self, action):
 
-        action = np.asarray(
-            action,
-            dtype=np.float32,
-        )
-
         action = np.clip(
-            action,
+            np.asarray(action, dtype=np.float32),
             -1.0,
             1.0,
         )
 
-        old_state = self.state()
-
-        mass = self.domain["mass"]
-        drag = self.domain["drag"]
-        accel = self.domain["accel"]
+        old = self.state()
 
         acceleration = (
-            action * MAX_ACCEL * accel / mass
-            - drag * self.velocity
+            action
+            * MAX_ACCEL
+            * self.domain["accel"]
+            / self.domain["mass"]
+            - self.domain["drag"] * self.velocity
             + self.wind
         )
 
         self.velocity += acceleration * DT
 
-        speed = np.linalg.norm(
-            self.velocity
-        )
+        speed = np.linalg.norm(self.velocity)
 
         if speed > MAX_SPEED:
 
-            self.velocity *= (
-                MAX_SPEED / (speed + 1e-8)
-            )
+            self.velocity *= MAX_SPEED / (speed + 1e-8)
 
-        self.position += (
-            self.velocity * DT
-        )
+        self.position += self.velocity * DT
 
         self.position[0] = np.clip(
             self.position[0],
@@ -462,10 +388,9 @@ class DroneEnv:
             WORLD_H - DRONE_RADIUS,
         )
 
-        # Wind changes after the drone transition.
         self.wind = (
             WIND_DECAY * self.wind
-            + np.random.normal(
+            + self.rng.normal(
                 0.0,
                 self.wind_noise,
                 size=2,
@@ -478,47 +403,38 @@ class DroneEnv:
             55.0,
         )
 
-        return self.state() - old_state
+        return self.state() - old
 
     def step(self, action):
 
         self.step_drone(action)
+
         self.target.advance()
 
         return self.state()
 
 
 # ============================================================
-# 4. BASELINE PD CONTROLLER
+# 3. CONTROLLERS AND SAFETY FILTER
 # ============================================================
 
-def pd_controller(
-    state,
-    target_position,
-    target_velocity,
-):
+def pd_controller(state, target_position, target_velocity):
 
     position = state[:2]
     velocity = state[2:4]
 
-    error = (
-        target_position - position
-    )
+    error = target_position - position
 
-    desired_velocity = (
-        target_velocity + 0.62 * error
-    )
+    desired_velocity = target_velocity + 0.55 * error
 
-    desired_velocity = np.clip(
-        desired_velocity,
-        -MAX_SPEED,
-        MAX_SPEED,
-    )
+    speed = np.linalg.norm(desired_velocity)
+
+    if speed > MAX_SPEED:
+
+        desired_velocity *= MAX_SPEED / (speed + 1e-8)
 
     acceleration = (
-        2.0 * (
-            desired_velocity - velocity
-        )
+        2.3 * (desired_velocity - velocity)
         - state[4:6]
     )
 
@@ -526,79 +442,166 @@ def pd_controller(
         acceleration / MAX_ACCEL,
         -1.0,
         1.0,
+    ).astype(np.float32)
+
+
+def predictive_safety_filter(action, state):
+
+    """
+    Heuristic velocity-aware obstacle correction.
+
+    This is not a formal control barrier function.
+    """
+
+    action = np.asarray(
+        action,
+        dtype=np.float32,
+    ).copy()
+
+    delta = state[:2] - OBSTACLE
+
+    distance = np.linalg.norm(delta) + 1e-8
+
+    normal = delta / distance
+
+    clearance = distance - SAFE_RADIUS
+
+    closing_speed = -float(
+        np.dot(state[2:4], normal)
     )
 
+    if clearance < 75.0:
 
-def avoid_obstacle(action, position):
-
-    delta = position - OBSTACLE
-
-    distance = (
-        np.linalg.norm(delta) + 1e-8
-    )
-
-    if distance < SAFE_RADIUS:
-
-        correction = (
-            delta / distance
-        ) * (
-            1.4
-            * (SAFE_RADIUS - distance)
-            / SAFE_RADIUS
+        urgency = np.clip(
+            (75.0 - clearance) / 75.0,
+            0.0,
+            1.0,
         )
 
-        action = action + correction
+        braking = max(0.0, closing_speed) / MAX_SPEED
+
+        correction = urgency * (
+            0.45 + 0.8 * braking
+        )
+
+        action += normal * correction
+
+        inward_component = float(
+            np.dot(action, normal)
+        )
+
+        if inward_component < 0.0:
+
+            action -= normal * inward_component
 
     return np.clip(
         action,
         -1.0,
         1.0,
+    ).astype(np.float32)
+
+
+# ============================================================
+# 4. DATA COLLECTION
+# ============================================================
+
+def smooth_random_action(
+    previous,
+    rho=0.82,
+    scale=0.45,
+):
+
+    noise = np.random.normal(
+        0.0,
+        scale,
+        size=2,
+    )
+
+    return np.clip(
+        rho * previous + (1.0 - rho) * noise,
+        -1.0,
+        1.0,
     )
 
 
-# ============================================================
-# 5. DATA COLLECTION UNDER DOMAIN RANDOMIZATION
-# ============================================================
-
-def collect_domain_data(domain):
+def collect_data():
 
     inputs = []
     targets = []
+    episode_ids = []
 
-    for episode in range(
-        DATA_EPISODES_PER_DOMAIN
-    ):
+    total_steps = DATA_EPISODES * STEPS_PER_EPISODE
+
+    print(
+        f"Collecting {DATA_EPISODES} episodes "
+        f"({total_steps:,} transitions)."
+    )
+
+    for episode in range(DATA_EPISODES):
+
+        domain = random_domain()
 
         env = DroneEnv(
-            domain=domain,
-            wind_noise=WIND_NOISE_TRAIN,
+            domain,
+            WIND_NOISE_TRAIN,
         )
 
-        env.reset()
+        state = env.reset(
+            seed=SEED + 1000 + episode
+        )
 
-        for _ in range(
-            DATA_STEPS_PER_EPISODE
-        ):
+        env.target.center = np.array(
+            [
+                np.random.uniform(650.0, 760.0),
+                np.random.uniform(250.0, 370.0),
+            ],
+            dtype=np.float32,
+        )
 
-            state = env.state()
+        smooth_action = np.zeros(
+            2,
+            dtype=np.float32,
+        )
 
-            action = pd_controller(
+        for step in range(STEPS_PER_EPISODE):
+
+            teacher = pd_controller(
                 state,
                 env.target.position(),
                 env.target.velocity(),
             )
 
-            action = avoid_obstacle(
-                action,
-                state[:2],
-            )
+            mode = np.random.rand()
 
-            # Random exploration broadens the action distribution.
-            action += np.random.normal(
-                0.0,
-                0.35,
-                size=2,
-            )
+            if mode < 0.42:
+
+                action = (
+                    teacher
+                    + np.random.normal(0.0, 0.28, size=2)
+                )
+
+            elif mode < 0.68:
+
+                action = np.random.uniform(
+                    -1.0,
+                    1.0,
+                    size=2,
+                )
+
+            elif mode < 0.88:
+
+                smooth_action = smooth_random_action(
+                    smooth_action
+                )
+
+                action = smooth_action
+
+            else:
+
+                action = (
+                    -np.sign(state[2:4])
+                    * np.random.uniform(0.25, 1.0, 2)
+                )
 
             action = np.clip(
                 action,
@@ -606,61 +609,57 @@ def collect_domain_data(domain):
                 1.0,
             ).astype(np.float32)
 
+            action = predictive_safety_filter(
+                action,
+                state,
+            )
+
             model_input = np.concatenate(
                 [
                     state,
                     action,
+                    domain_vector(domain),
                 ]
             ).astype(np.float32)
 
-            delta = env.step_drone(
-                action
-            )
+            delta = env.step_drone(action)
 
             inputs.append(model_input)
             targets.append(delta)
+            episode_ids.append(episode)
 
             env.target.advance()
 
+            state = env.state()
+
     return (
-        np.asarray(
-            inputs,
-            dtype=np.float32,
-        ),
-        np.asarray(
-            targets,
-            dtype=np.float32,
-        ),
+        np.asarray(inputs, dtype=np.float32),
+        np.asarray(targets, dtype=np.float32),
+        np.asarray(episode_ids, dtype=np.int32),
     )
 
 
 # ============================================================
-# 6. NEURAL NETWORK DYNAMICS MODEL
+# 5. BOOTSTRAPPED DYNAMICS ENSEMBLE
 # ============================================================
 
 class DynamicsModel(nn.Module):
-
-    """
-    Input:
-        [x, y, vx, vy, wind_x, wind_y, ax, ay]
-
-    Output:
-        [delta_x, delta_y, delta_vx, delta_vy,
-         delta_wind_x, delta_wind_y]
-
-    Predicting delta state makes learning the transition easier.
-    """
 
     def __init__(self):
 
         super().__init__()
 
         self.net = nn.Sequential(
-            nn.Linear(8, HIDDEN),
-            nn.ReLU(),
+            nn.Linear(INPUT_SIZE, HIDDEN),
+            nn.SiLU(),
+
             nn.Linear(HIDDEN, HIDDEN),
-            nn.ReLU(),
-            nn.Linear(HIDDEN, 6),
+            nn.SiLU(),
+
+            nn.Linear(HIDDEN, HIDDEN),
+            nn.SiLU(),
+
+            nn.Linear(HIDDEN, OUTPUT_SIZE),
         )
 
     def forward(self, x):
@@ -668,396 +667,704 @@ class DynamicsModel(nn.Module):
         return self.net(x)
 
 
-@dataclass
-class Normalizer:
-
-    x_mean: torch.Tensor
-    x_std: torch.Tensor
-
-    y_mean: torch.Tensor
-    y_std: torch.Tensor
-
-
-def make_normalizer(x, y):
-
-    return Normalizer(
-        x.mean(dim=0),
-        x.std(dim=0).clamp_min(1e-5),
-        y.mean(dim=0),
-        y.std(dim=0).clamp_min(1e-5),
-    )
-
-
-# ============================================================
-# 7. DOMAIN-SPECIFIC MODEL ENSEMBLE
-# ============================================================
-
-class DomainEnsemble:
+class DynamicsEnsemble:
 
     def __init__(self):
 
         self.models = [
             DynamicsModel().to(DEVICE)
-            for _ in DOMAINS
+            for _ in range(MODEL_COUNT)
         ]
 
-        self.normalizers = []
+        self.x_mean = None
+        self.x_std = None
+
+        self.y_mean = None
+        self.y_std = None
 
         self.train_curves = []
-        self.validation_curves = []
+        self.val_curves = []
 
-        self.validation_data = []
+        self.validation = None
 
-    def train_one_model(
-        self,
-        model,
-        x_np,
-        y_np,
-    ):
+    def normalize_x(self, x):
 
-        x = torch.tensor(
+        return (x - self.x_mean) / self.x_std
+
+    def normalize_y(self, y):
+
+        return (y - self.y_mean) / self.y_std
+
+    def denormalize_y(self, y):
+
+        return y * self.y_std + self.y_mean
+
+    def train(self, x_np, y_np, episode_ids):
+
+        x = torch.as_tensor(
             x_np,
             dtype=torch.float32,
             device=DEVICE,
         )
 
-        y = torch.tensor(
+        y = torch.as_tensor(
             y_np,
             dtype=torch.float32,
             device=DEVICE,
         )
 
-        permutation = torch.randperm(
-            len(x),
+        groups = np.unique(episode_ids)
+
+        rng = np.random.default_rng(SEED + 77)
+
+        shuffled = rng.permutation(groups)
+
+        split = max(
+            1,
+            int(0.85 * len(shuffled)),
+        )
+
+        train_groups = set(
+            shuffled[:split].tolist()
+        )
+
+        val_groups = set(
+            shuffled[split:].tolist()
+        )
+
+        train_mask_np = np.isin(
+            episode_ids,
+            list(train_groups),
+        )
+
+        val_mask_np = np.isin(
+            episode_ids,
+            list(val_groups),
+        )
+
+        train_idx = torch.as_tensor(
+            np.flatnonzero(train_mask_np),
+            dtype=torch.long,
             device=DEVICE,
         )
 
-        split = int(
-            0.85 * len(x)
+        val_idx = torch.as_tensor(
+            np.flatnonzero(val_mask_np),
+            dtype=torch.long,
+            device=DEVICE,
         )
 
-        train_idx = permutation[:split]
-        val_idx = permutation[split:]
+        if len(train_idx) == 0 or len(val_idx) == 0:
 
-        x_train = x[train_idx]
-        y_train = y[train_idx]
+            raise RuntimeError(
+                "Episode-level train/validation split is empty."
+            )
 
-        x_val = x[val_idx]
-        y_val = y[val_idx]
+        x_train_raw = x[train_idx]
+        y_train_raw = y[train_idx]
 
-        normalizer = make_normalizer(
-            x_train,
-            y_train,
+        x_val_raw = x[val_idx]
+        y_val_raw = y[val_idx]
+
+        self.x_mean = x_train_raw.mean(0)
+
+        self.x_std = x_train_raw.std(0).clamp_min(1e-4)
+
+        self.y_mean = y_train_raw.mean(0)
+
+        self.y_std = y_train_raw.std(0).clamp_min(1e-4)
+
+        x_train = self.normalize_x(x_train_raw)
+        y_train = self.normalize_y(y_train_raw)
+
+        x_val = self.normalize_x(x_val_raw)
+        y_val = self.normalize_y(y_val_raw)
+
+        self.validation = (
+            x_val_raw.detach().cpu().numpy(),
+            y_val_raw.detach().cpu().numpy(),
         )
 
-        self.normalizers.append(
-            normalizer
+        train_episode_ids = episode_ids[train_mask_np]
+
+        train_episode_groups = np.unique(
+            train_episode_ids
         )
 
-        x_train = (
-            x_train - normalizer.x_mean
-        ) / normalizer.x_std
+        for member, model in enumerate(self.models):
 
-        y_train = (
-            y_train - normalizer.y_mean
-        ) / normalizer.y_std
+            print(
+                f"\nTraining ensemble member "
+                f"{member + 1}/{MODEL_COUNT}"
+            )
 
-        x_val_norm = (
-            x_val - normalizer.x_mean
-        ) / normalizer.x_std
+            optimizer = optim.AdamW(
+                model.parameters(),
+                lr=LEARNING_RATE,
+                weight_decay=WEIGHT_DECAY,
+            )
 
-        y_val_norm = (
-            y_val - normalizer.y_mean
-        ) / normalizer.y_std
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=EPOCHS,
+            )
 
-        optimizer = optim.Adam(
-            model.parameters(),
-            lr=LEARNING_RATE,
-        )
+            # ------------------------------------------------
+            # TRUE EPISODE BOOTSTRAPPING
+            # ------------------------------------------------
+            # Sampling episodes with replacement must preserve
+            # duplicate episode selections.
+            #
+            # np.isin() would remove duplicate bootstrap samples.
+            # We explicitly concatenate each sampled episode's rows.
 
-        loss_fn = nn.MSELoss()
+            sampled_groups = rng.choice(
+                train_episode_groups,
+                size=len(train_episode_groups),
+                replace=True,
+            )
 
-        train_history = []
-        val_history = []
+            bootstrap_rows = np.concatenate(
+                [
+                    np.flatnonzero(
+                        train_episode_ids == group
+                    )
+                    for group in sampled_groups
+                ]
+            )
 
-        for epoch in range(EPOCHS):
-
-            model.train()
-
-            permutation = torch.randperm(
-                len(x_train),
+            bootstrap_idx = torch.as_tensor(
+                bootstrap_rows,
+                dtype=torch.long,
                 device=DEVICE,
             )
 
-            batch_losses = []
+            member_x = x_train[bootstrap_idx]
+            member_y = y_train[bootstrap_idx]
 
-            for start in range(
-                0,
-                len(permutation),
-                BATCH_SIZE,
-            ):
+            train_history = []
+            val_history = []
 
-                idx = permutation[
-                    start:start + BATCH_SIZE
-                ]
+            for epoch in range(EPOCHS):
 
-                prediction = model(
-                    x_train[idx]
+                model.train()
+
+                order = torch.randperm(
+                    len(member_x),
+                    device=DEVICE,
                 )
 
-                loss = loss_fn(
-                    prediction,
-                    y_train[idx],
+                batch_losses = []
+
+                for start in range(
+                    0,
+                    len(order),
+                    BATCH_SIZE,
+                ):
+
+                    idx = order[
+                        start:start + BATCH_SIZE
+                    ]
+
+                    prediction = model(member_x[idx])
+
+                    loss = nn.functional.smooth_l1_loss(
+                        prediction,
+                        member_y[idx],
+                    )
+
+                    optimizer.zero_grad(
+                        set_to_none=True
+                    )
+
+                    loss.backward()
+
+                    nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        5.0,
+                    )
+
+                    optimizer.step()
+
+                    batch_losses.append(
+                        float(loss.item())
+                    )
+
+                model.eval()
+
+                with torch.no_grad():
+
+                    val_loss = nn.functional.smooth_l1_loss(
+                        model(x_val),
+                        y_val,
+                    ).item()
+
+                train_history.append(
+                    float(np.mean(batch_losses))
                 )
 
-                optimizer.zero_grad()
-                loss.backward()
-
-                nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    5.0,
+                val_history.append(
+                    float(val_loss)
                 )
 
-                optimizer.step()
+                scheduler.step()
 
-                batch_losses.append(
-                    loss.item()
-                )
+                if (epoch + 1) % 15 == 0:
+
+                    print(
+                        f"  epoch {epoch + 1:3d}/{EPOCHS} "
+                        f"train={train_history[-1]:.4f} "
+                        f"val={val_loss:.4f}"
+                    )
+
+            self.train_curves.append(train_history)
+            self.val_curves.append(val_history)
+
+    # --------------------------------------------------------
+    # CORRECTED ENSEMBLE PREDICTION
+    # --------------------------------------------------------
+
+    def predict_all(self, model_input):
+
+        """
+        Return:
+
+            Single input:
+                (MODEL_COUNT, OUTPUT_SIZE)
+
+            Batch input:
+                (MODEL_COUNT, BATCH_SIZE, OUTPUT_SIZE)
+
+        Supports one-dimensional and two-dimensional inputs.
+        """
+
+        array = np.asarray(
+            model_input,
+            dtype=np.float32,
+        )
+
+        single = array.ndim == 1
+
+        if single:
+
+            array = array.reshape(1, -1)
+
+        if array.ndim != 2:
+
+            raise ValueError(
+                "predict_all expects a 1D input or a 2D batch. "
+                f"Received shape: {array.shape}"
+            )
+
+        if array.shape[-1] != INPUT_SIZE:
+
+            raise ValueError(
+                f"Expected input dimension {INPUT_SIZE}, "
+                f"received {array.shape[-1]}"
+            )
+
+        x = torch.as_tensor(
+            array,
+            dtype=torch.float32,
+            device=DEVICE,
+        )
+
+        x = self.normalize_x(x)
+
+        predictions = []
+
+        for model in self.models:
 
             model.eval()
 
             with torch.no_grad():
 
-                val_prediction = model(
-                    x_val_norm
+                y = self.denormalize_y(
+                    model(x)
                 )
 
-                val_loss = loss_fn(
-                    val_prediction,
-                    y_val_norm,
-                ).item()
-
-            train_history.append(
-                float(np.mean(batch_losses))
+            predictions.append(
+                y.cpu().numpy()
             )
 
-            val_history.append(
-                float(val_loss)
-            )
-
-        self.validation_data.append(
-            (
-                x_val.detach().cpu().numpy(),
-                y_val.detach().cpu().numpy(),
-            )
-        )
-
-        return train_history, val_history
-
-    def train(self, datasets):
-
-        for index, (
-            model,
-            dataset,
-        ) in enumerate(
-            zip(self.models, datasets)
-        ):
-
-            print(
-                f"Training model {index + 1}/"
-                f"{len(self.models)}: "
-                f"{DOMAINS[index]['name']}"
-            )
-
-            train_curve, val_curve = (
-                self.train_one_model(
-                    model,
-                    dataset[0],
-                    dataset[1],
-                )
-            )
-
-            self.train_curves.append(
-                train_curve
-            )
-
-            self.validation_curves.append(
-                val_curve
-            )
-
-    def predict_member(
-        self,
-        member_index,
-        model_input,
-    ):
-
-        model = self.models[
-            member_index
-        ]
-
-        normalizer = self.normalizers[
-            member_index
-        ]
-
-        x = torch.as_tensor(
-            model_input,
-            dtype=torch.float32,
-            device=DEVICE,
-        )
-
-        x_norm = (
-            x - normalizer.x_mean
-        ) / normalizer.x_std
-
-        model.eval()
-
-        with torch.no_grad():
-
-            y_norm = model(x_norm)
-
-            y = (
-                y_norm * normalizer.y_std
-                + normalizer.y_mean
-            )
-
-        return y.detach().cpu().numpy()
-
-    def predict_all(self, model_input):
-
-        return np.stack(
-            [
-                self.predict_member(
-                    i,
-                    model_input,
-                )
-                for i in range(
-                    len(self.models)
-                )
-            ],
+        result = np.stack(
+            predictions,
             axis=0,
         )
 
+        # Shape:
+        # single input -> (MODEL_COUNT, 1, OUTPUT_SIZE)
+        # batch input  -> (MODEL_COUNT, BATCH_SIZE, OUTPUT_SIZE)
+
+        if single:
+
+            return result[:, 0, :]
+
+        return result
+
 
 # ============================================================
-# 8. TRUE AND LEARNED TRANSITIONS
+# 6. TRANSITION MODELS
 # ============================================================
 
-def oracle_transition(
-    state,
-    action,
+def oracle_transition_batch(
+    states,
+    actions,
     domain,
-    predict_wind=True,
 ):
 
-    mass = domain["mass"]
-    drag = domain["drag"]
-    accel = domain["accel"]
+    states = np.asarray(
+        states,
+        dtype=np.float32,
+    )
 
-    position = state[:2].copy()
-    velocity = state[2:4].copy()
-    wind = state[4:6].copy()
+    actions = np.clip(
+        np.asarray(actions, dtype=np.float32),
+        -1.0,
+        1.0,
+    )
+
+    position = states[:, :2].copy()
+    velocity = states[:, 2:4].copy()
+    wind = states[:, 4:6].copy()
 
     acceleration = (
-        action * MAX_ACCEL * accel / mass
-        - drag * velocity
+        actions
+        * MAX_ACCEL
+        * domain["accel"]
+        / domain["mass"]
+        - domain["drag"] * velocity
         + wind
     )
 
     velocity += acceleration * DT
 
-    speed = np.linalg.norm(velocity)
+    speeds = np.linalg.norm(
+        velocity,
+        axis=1,
+        keepdims=True,
+    )
 
-    if speed > MAX_SPEED:
-
-        velocity *= (
-            MAX_SPEED / (speed + 1e-8)
-        )
+    velocity *= np.minimum(
+        1.0,
+        MAX_SPEED / (speeds + 1e-8),
+    )
 
     position += velocity * DT
 
-    position[0] = np.clip(
-        position[0],
+    position[:, 0] = np.clip(
+        position[:, 0],
         DRONE_RADIUS,
         WORLD_W - DRONE_RADIUS,
     )
 
-    position[1] = np.clip(
-        position[1],
+    position[:, 1] = np.clip(
+        position[:, 1],
         DRONE_RADIUS,
         WORLD_H - DRONE_RADIUS,
     )
 
-    if predict_wind:
-
-        # Expected future wind, without future random noise.
-        wind = WIND_DECAY * wind
+    wind *= WIND_DECAY
 
     return np.concatenate(
         [
             position,
             velocity,
             wind,
-        ]
+        ],
+        axis=1,
     ).astype(np.float32)
 
 
-def learned_transition(
-    model,
-    state,
-    action,
+def learned_transition_ensemble(
+    ensemble,
+    states,
+    actions,
+    domain,
 ):
+
+    """
+    Predict next states for all ensemble members.
+
+    Input:
+        states:  (N, 6)
+        actions: (N, 2)
+
+    Output:
+        (MODEL_COUNT, N, 6)
+    """
+
+    states = np.asarray(
+        states,
+        dtype=np.float32,
+    )
+
+    actions = np.asarray(
+        actions,
+        dtype=np.float32,
+    )
+
+    params = np.repeat(
+        domain_vector(domain)[None, :],
+        len(states),
+        axis=0,
+    )
 
     model_input = np.concatenate(
         [
-            state,
-            action,
-        ]
-    ).astype(np.float32)
-
-    delta = model.predict_member(
-        0,
-        model_input,
+            states,
+            actions,
+            params,
+        ],
+        axis=1,
     )
 
-    next_state = state + delta
+    deltas = ensemble.predict_all(model_input)
 
-    next_state[:2] = np.clip(
-        next_state[:2],
+    next_states = states[None, :, :] + deltas
+
+    next_states[:, :, 0] = np.clip(
+        next_states[:, :, 0],
         DRONE_RADIUS,
         WORLD_W - DRONE_RADIUS,
     )
 
-    next_state[2:4] = np.clip(
-        next_state[2:4],
-        -MAX_SPEED,
-        MAX_SPEED,
+    next_states[:, :, 1] = np.clip(
+        next_states[:, :, 1],
+        DRONE_RADIUS,
+        WORLD_H - DRONE_RADIUS,
     )
 
-    next_state[4:6] = np.clip(
-        next_state[4:6],
+    velocity = next_states[:, :, 2:4]
+
+    speeds = np.linalg.norm(
+        velocity,
+        axis=2,
+        keepdims=True,
+    )
+
+    velocity *= np.minimum(
+        1.0,
+        MAX_SPEED / (speeds + 1e-8),
+    )
+
+    next_states[:, :, 4:6] = np.clip(
+        next_states[:, :, 4:6],
         -55.0,
         55.0,
     )
 
-    return next_state.astype(
-        np.float32
+    return next_states.astype(np.float32)
+
+
+def learned_transition_independent_members(
+    ensemble,
+    states,
+    actions,
+    domain,
+):
+
+    """
+    Independently propagate each ensemble member.
+
+    Input:
+        states:  (MODEL_COUNT, N, 6)
+        actions: (N, 2)
+
+    Output:
+        (MODEL_COUNT, N, 6)
+
+    IMPORTANT:
+        Each member receives its own previous predicted state.
+        This prevents ensemble rollouts from collapsing onto member 0.
+    """
+
+    states = np.asarray(
+        states,
+        dtype=np.float32,
     )
 
+    actions = np.asarray(
+        actions,
+        dtype=np.float32,
+    )
+
+    member_count, batch_size, state_dim = states.shape
+
+    if member_count != MODEL_COUNT:
+
+        raise ValueError(
+            f"Expected {MODEL_COUNT} ensemble members, "
+            f"received {member_count}"
+        )
+
+    if state_dim != 6:
+
+        raise ValueError(
+            f"Expected state dimension 6, got {state_dim}"
+        )
+
+    if actions.shape != (batch_size, 2):
+
+        raise ValueError(
+            "Actions must have shape "
+            f"({batch_size}, 2), got {actions.shape}"
+        )
+
+    flat_states = states.reshape(
+        member_count * batch_size,
+        6,
+    )
+
+    flat_actions = np.tile(
+        actions,
+        (member_count, 1),
+    )
+
+    flat_params = np.repeat(
+        domain_vector(domain)[None, :],
+        member_count * batch_size,
+        axis=0,
+    )
+
+    model_input = np.concatenate(
+        [
+            flat_states,
+            flat_actions,
+            flat_params,
+        ],
+        axis=1,
+    )
+
+    # All models predict all flattened states.
+    all_deltas = ensemble.predict_all(model_input)
+
+    next_states = np.empty_like(states)
+
+    # Select each model's prediction for its own rollout states.
+    for member in range(member_count):
+
+        start = member * batch_size
+        end = start + batch_size
+
+        member_delta = all_deltas[
+            member,
+            start:end,
+        ]
+
+        next_states[member] = (
+            states[member] + member_delta
+        )
+
+    next_states[:, :, 0] = np.clip(
+        next_states[:, :, 0],
+        DRONE_RADIUS,
+        WORLD_W - DRONE_RADIUS,
+    )
+
+    next_states[:, :, 1] = np.clip(
+        next_states[:, :, 1],
+        DRONE_RADIUS,
+        WORLD_H - DRONE_RADIUS,
+    )
+
+    velocity = next_states[:, :, 2:4]
+
+    speeds = np.linalg.norm(
+        velocity,
+        axis=2,
+        keepdims=True,
+    )
+
+    velocity *= np.minimum(
+        1.0,
+        MAX_SPEED / (speeds + 1e-8),
+    )
+
+    next_states[:, :, 4:6] = np.clip(
+        next_states[:, :, 4:6],
+        -55.0,
+        55.0,
+    )
+
+    return next_states.astype(np.float32)
+
 
 # ============================================================
-# 9. NOMINAL ACTION SEQUENCE
+# 7. MPC COST
 # ============================================================
+
+def state_cost(
+    state,
+    target_position,
+    target_velocity,
+    action,
+    previous_action,
+):
+
+    position = state[:2]
+    velocity = state[2:4]
+
+    distance = np.linalg.norm(
+        position - target_position
+    )
+
+    velocity_error = np.linalg.norm(
+        velocity - target_velocity
+    )
+
+    obstacle_distance = np.linalg.norm(
+        position - OBSTACLE
+    )
+
+    safety_clearance = (
+        obstacle_distance - SAFE_RADIUS
+    )
+
+    obstacle_penalty = max(
+        0.0,
+        35.0 - safety_clearance,
+    ) ** 2
+
+    boundary_margin = min(
+        position[0] - DRONE_RADIUS,
+        WORLD_W - DRONE_RADIUS - position[0],
+        position[1] - DRONE_RADIUS,
+        WORLD_H - DRONE_RADIUS - position[1],
+    )
+
+    boundary_penalty = max(
+        0.0,
+        45.0 - boundary_margin,
+    ) ** 2
+
+    effort = float(
+        np.sum(action ** 2)
+    )
+
+    action_change = float(
+        np.sum((action - previous_action) ** 2)
+    )
+
+    return (
+        W_DISTANCE * distance
+        + W_VELOCITY * velocity_error
+        + W_OBSTACLE * obstacle_penalty
+        + W_BOUNDARY * boundary_penalty
+        + W_ACTION * effort
+        + W_ACTION_CHANGE * action_change
+    )
+
 
 def make_nominal_sequence(
     state,
     target,
+    domain=NOMINAL_DOMAIN,
 ):
 
-    nominal_state = state.copy()
+    current = state.copy()
 
     sequence = []
-
-    nominal_domain = DOMAINS[2]
 
     for t in range(
         1,
@@ -1065,23 +1372,23 @@ def make_nominal_sequence(
     ):
 
         action = pd_controller(
-            nominal_state,
+            current,
             target_at(target, t),
             target_velocity_at(target, t),
         )
 
-        action = avoid_obstacle(
+        action = predictive_safety_filter(
             action,
-            nominal_state[:2],
+            current,
         )
 
         sequence.append(action)
 
-        nominal_state = oracle_transition(
-            nominal_state,
-            action,
-            nominal_domain,
-        )
+        current = oracle_transition_batch(
+            current[None, :],
+            action[None, :],
+            domain,
+        )[0]
 
     return np.asarray(
         sequence,
@@ -1090,51 +1397,10 @@ def make_nominal_sequence(
 
 
 # ============================================================
-# 10. RISK-SENSITIVE CANDIDATE EVALUATION
+# 8. ROBUST CANDIDATE EVALUATION
 # ============================================================
 
-def trajectory_cost(
-    state,
-    action,
-    target_position,
-):
-
-    position = state[:2]
-
-    distance = np.linalg.norm(
-        position - target_position
-    )
-
-    obstacle_distance = np.linalg.norm(
-        position - OBSTACLE
-    )
-
-    obstacle_violation = max(
-        0.0,
-        SAFE_RADIUS - obstacle_distance,
-    )
-
-    boundary_margin = min(
-        position[0],
-        WORLD_W - position[0],
-        position[1],
-        WORLD_H - position[1],
-    )
-
-    boundary_violation = max(
-        0.0,
-        45.0 - boundary_margin,
-    )
-
-    return (
-        0.045 * distance
-        + 2.0 * obstacle_violation ** 2
-        + 1.5 * boundary_violation ** 2
-        + 0.012 * np.sum(action ** 2)
-    )
-
-
-def evaluate_candidates(
+def evaluate_candidate_batch(
     initial_state,
     candidates,
     target,
@@ -1144,345 +1410,487 @@ def evaluate_candidates(
 ):
 
     """
-    candidates:
-        (candidate_count, horizon, 2)
+    Evaluate candidate sequences across domains and models.
 
-    Learned-model rollout:
-        Every domain model predicts its own trajectory.
-
-    Robust objective:
-        mean_cost
-        + risk_weight * standard_deviation
-        + worst_case_weight * maximum_cost
-
-    Nominal MPC:
-        Uses only the nominal-domain model.
-
-    Oracle MPC:
-        Uses true dynamics and the actual test-domain parameters.
+    Robust MPC:
+        - Maintains independent rollout state for every model.
+        - Evaluates all training domains.
+        - Aggregates mean, standard deviation, and worst-case cost.
     """
 
-    candidate_count = len(candidates)
-
-    model_indices = (
-        [2]
-        if mode == "Nominal MPC"
-        else list(range(MODEL_COUNT))
+    candidates = np.asarray(
+        candidates,
+        dtype=np.float32,
     )
+
+    count = len(candidates)
 
     if mode == "Oracle MPC":
 
         if oracle_domain is None:
+
             raise ValueError(
-                "Oracle MPC requires the actual test domain."
+                "Oracle MPC requires oracle_domain."
             )
 
-        model_indices = [-1]
+        domains = [oracle_domain]
 
-    all_costs = []
+    elif mode == "Nominal MPC":
 
-    all_paths = []
-    all_uncertainties = []
+        domains = [NOMINAL_DOMAIN]
 
-    for model_index in model_indices:
+    else:
+
+        domains = TRAIN_DOMAINS
+
+    rollout_costs = []
+    rollout_paths = []
+
+    for domain in domains:
+
+        if mode == "Oracle MPC":
+
+            member_count = 1
+
+        elif mode == "Nominal MPC":
+
+            member_count = 1
+
+        else:
+
+            member_count = MODEL_COUNT
 
         states = np.repeat(
-            initial_state[None, :],
-            candidate_count,
+            initial_state[None, None, :],
+            member_count * count,
             axis=0,
+        ).reshape(
+            member_count,
+            count,
+            6,
         ).astype(np.float32)
 
         costs = np.zeros(
-            candidate_count,
+            (member_count, count),
             dtype=np.float64,
         )
 
-        path = []
-        uncertainty = []
+        paths = np.zeros(
+            (
+                member_count,
+                count,
+                MPC_HORIZON,
+                2,
+            ),
+            dtype=np.float32,
+        )
 
-        for t in range(
-            MPC_HORIZON
-        ):
+        previous_actions = np.zeros(
+            (
+                member_count,
+                count,
+                2,
+            ),
+            dtype=np.float32,
+        )
+
+        for t in range(MPC_HORIZON):
 
             actions = candidates[:, t, :]
 
-            if model_index == -1:
+            if mode == "Oracle MPC":
 
-                next_states = np.stack(
-                    [
-                        oracle_transition(
-                            states[i],
-                            actions[i],
-                            oracle_domain,
-                        )
-                        for i in range(
-                            candidate_count
-                        )
-                    ],
+                next_states = oracle_transition_batch(
+                    states[0],
+                    actions,
+                    domain,
+                )[None, :, :]
+
+            elif mode == "Nominal MPC":
+
+                predictions = learned_transition_ensemble(
+                    ensemble,
+                    states[0],
+                    actions,
+                    domain,
+                )
+
+                next_states = np.mean(
+                    predictions,
                     axis=0,
+                    keepdims=True,
                 )
 
             else:
 
-                model_inputs = np.concatenate(
-                    [
-                        states,
-                        actions,
-                    ],
-                    axis=1,
+                # Corrected:
+                # Every ensemble member continues from its own state.
+                next_states = learned_transition_independent_members(
+                    ensemble,
+                    states,
+                    actions,
+                    domain,
                 )
 
-                deltas = ensemble.predict_member(
-                    model_index,
-                    model_inputs,
-                )
-
-                next_states = (
-                    states + deltas
-                )
-
-                next_states[:, :2] = np.clip(
-                    next_states[:, :2],
-                    DRONE_RADIUS,
-                    WORLD_W - DRONE_RADIUS,
-                )
-
-                next_states[:, 2:4] = np.clip(
-                    next_states[:, 2:4],
-                    -MAX_SPEED,
-                    MAX_SPEED,
-                )
-
-                next_states[:, 4:6] = np.clip(
-                    next_states[:, 4:6],
-                    -55.0,
-                    55.0,
-                )
-
-            target_position = target_at(
+            tp = target_at(
                 target,
                 t + 1,
             )
 
-            for i in range(
-                candidate_count
-            ):
+            tv = target_velocity_at(
+                target,
+                t + 1,
+            )
 
-                costs[i] += trajectory_cost(
-                    next_states[i],
-                    actions[i],
-                    target_position,
-                )
+            for member in range(member_count):
+
+                for candidate_index in range(count):
+
+                    costs[member, candidate_index] += state_cost(
+                        next_states[member, candidate_index],
+                        tp,
+                        tv,
+                        actions[candidate_index],
+                        previous_actions[member, candidate_index],
+                    )
 
             states = next_states
 
-            path.append(
-                states[:, :2].copy()
-            )
+            paths[:, :, t, :] = states[:, :, :2]
 
-        all_costs.append(costs)
+            previous_actions[:] = actions[None, :, :]
 
-        all_paths.append(
-            np.stack(path, axis=1)
-        )
-
-    all_costs = np.stack(
-        all_costs,
-        axis=0,
-    )
-
-    all_paths = np.stack(
-        all_paths,
-        axis=0,
-    )
-
-    if mode == "Nominal MPC" or mode == "Oracle MPC":
-
-        robust_cost = all_costs[0]
-
-        best_index = int(
-            np.argmin(robust_cost)
-        )
-
-        best_path = all_paths[
-            0, best_index
-        ]
-
-        return (
-            robust_cost,
-            best_path,
-            np.zeros(MPC_HORIZON),
-        )
-
-    # Robust cost across all randomized domains.
-    mean_cost = np.mean(
-        all_costs,
-        axis=0,
-    )
-
-    std_cost = np.std(
-        all_costs,
-        axis=0,
-    )
-
-    worst_cost = np.max(
-        all_costs,
-        axis=0,
-    )
-
-    robust_cost = (
-        mean_cost
-        + ROBUST_RISK_WEIGHT * std_cost
-        + ROBUST_WORST_WEIGHT * worst_cost
-    )
-
-    best_index = int(
-        np.argmin(robust_cost)
-    )
-
-    # Show mean position path across domains.
-    mean_path = np.mean(
-        all_paths[:, best_index],
-        axis=0,
-    )
-
-    # Show domain disagreement at each horizon step.
-    position_std = np.std(
-        all_paths[:, best_index],
-        axis=0,
-    )
-
-    path_uncertainty = np.sqrt(
-        np.sum(
-            position_std ** 2,
-            axis=1,
-        )
-    )
-
-    return (
-        robust_cost,
-        mean_path,
-        path_uncertainty,
-    )
-
-
-# ============================================================
-# 11. MPC ACTION SELECTION
-# ============================================================
-
-def choose_mpc_action(
-    state,
-    target,
-    ensemble,
-    mode,
-    oracle_domain=None,
-):
-
-    nominal = make_nominal_sequence(
-        state,
-        target,
-    )
-
-    candidates = np.repeat(
-        nominal[None, :, :],
-        MPC_CANDIDATES,
-        axis=0,
-    )
-
-    candidates += np.random.normal(
-        0.0,
-        ACTION_NOISE,
-        size=candidates.shape,
-    ).astype(np.float32)
-
-    candidates = np.clip(
-        candidates,
-        -1.0,
-        1.0,
-    )
-
-    candidates[0] = nominal
-
-    costs, best_path, uncertainty = (
-        evaluate_candidates(
-            state,
-            candidates,
+        terminal_position = target_at(
             target,
-            ensemble,
-            mode,
-            oracle_domain,
+            MPC_HORIZON,
         )
+
+        terminal_velocity = target_velocity_at(
+            target,
+            MPC_HORIZON,
+        )
+
+        terminal_distance = np.linalg.norm(
+            states[:, :, :2]
+            - terminal_position[None, None, :],
+            axis=2,
+        )
+
+        terminal_velocity_error = np.linalg.norm(
+            states[:, :, 2:4]
+            - terminal_velocity[None, None, :],
+            axis=2,
+        )
+
+        costs += (
+            W_TERMINAL_DISTANCE * terminal_distance
+            + W_TERMINAL_VELOCITY * terminal_velocity_error
+        )
+
+        rollout_costs.append(
+            costs.reshape(-1, count)
+        )
+
+        rollout_paths.append(
+            paths.reshape(
+                -1,
+                count,
+                MPC_HORIZON,
+                2,
+            )
+        )
+
+    all_costs = np.concatenate(
+        rollout_costs,
+        axis=0,
     )
 
-    best_index = int(
-        np.argmin(costs)
+    all_paths = np.concatenate(
+        rollout_paths,
+        axis=0,
+    )
+
+    if mode in (
+        "Nominal MPC",
+        "Oracle MPC",
+    ):
+
+        objective = all_costs.mean(axis=0)
+
+    else:
+
+        mean_cost = np.mean(
+            all_costs,
+            axis=0,
+        )
+
+        std_cost = np.std(
+            all_costs,
+            axis=0,
+        )
+
+        worst_cost = np.max(
+            all_costs,
+            axis=0,
+        )
+
+        objective = (
+            mean_cost
+            + ROBUST_RISK_WEIGHT * std_cost
+            + ROBUST_WORST_WEIGHT * worst_cost
+        )
+
+    best = int(
+        np.argmin(objective)
+    )
+
+    best_path = np.mean(
+        all_paths[:, best],
+        axis=0,
+    )
+
+    path_disagreement = np.std(
+        all_paths[:, best],
+        axis=0,
+    )
+
+    uncertainty = np.linalg.norm(
+        path_disagreement,
+        axis=1,
     )
 
     return (
-        candidates[best_index, 0].copy(),
+        objective,
         best_path,
         uncertainty,
     )
 
 
 # ============================================================
-# 12. EXECUTION SAFETY CORRECTION
+# 9. CEM MPC PLANNER
 # ============================================================
 
-def safety_filter(
-    action,
-    position,
-):
+class CEMPlanner:
 
-    delta = (
-        position - OBSTACLE
-    )
+    def __init__(self):
 
-    distance = (
-        np.linalg.norm(delta) + 1e-8
-    )
+        self.warm_mean = None
 
-    if distance < SAFE_RADIUS:
-
-        action = action + (
-            delta / distance
-        ) * (
-            1.0
-            * (SAFE_RADIUS - distance)
-            / SAFE_RADIUS
+        self.last_path = np.zeros(
+            (MPC_HORIZON, 2),
+            dtype=np.float32,
         )
 
-    return np.clip(
-        action,
-        -1.0,
-        1.0,
-    )
+        self.last_uncertainty = np.zeros(
+            MPC_HORIZON,
+            dtype=np.float32,
+        )
+
+    def reset(self):
+
+        self.warm_mean = None
+
+        self.last_path = np.zeros(
+            (MPC_HORIZON, 2),
+            dtype=np.float32,
+        )
+
+        self.last_uncertainty = np.zeros(
+            MPC_HORIZON,
+            dtype=np.float32,
+        )
+
+    def initial_distribution(
+        self,
+        state,
+        target,
+    ):
+
+        if self.warm_mean is None:
+
+            mean = make_nominal_sequence(
+                state,
+                target,
+            )
+
+        else:
+
+            mean = np.vstack(
+                [
+                    self.warm_mean[1:],
+                    self.warm_mean[-1:],
+                ]
+            ).astype(np.float32)
+
+        std = np.full(
+            (MPC_HORIZON, 2),
+            CEM_INITIAL_STD,
+            dtype=np.float32,
+        )
+
+        return mean, std
+
+    @staticmethod
+    def correlated_noise():
+
+        noise = np.random.normal(
+            0.0,
+            1.0,
+            size=(
+                CEM_CANDIDATES,
+                MPC_HORIZON,
+                2,
+            ),
+        ).astype(np.float32)
+
+        for t in range(1, MPC_HORIZON):
+
+            noise[:, t] = (
+                0.72 * noise[:, t - 1]
+                + math.sqrt(1.0 - 0.72 ** 2) * noise[:, t]
+            )
+
+        return noise
+
+    def plan(
+        self,
+        state,
+        target,
+        ensemble,
+        mode,
+        oracle_domain=None,
+    ):
+
+        mean, std = self.initial_distribution(
+            state,
+            target,
+        )
+
+        best_sequence = mean.copy()
+
+        best_path = self.last_path.copy()
+
+        best_uncertainty = self.last_uncertainty.copy()
+
+        best_cost = float("inf")
+
+        for _ in range(CEM_ITERATIONS):
+
+            noise = self.correlated_noise()
+
+            candidates = (
+                mean[None, :, :]
+                + noise * std[None, :, :]
+            )
+
+            candidates = np.clip(
+                candidates,
+                -1.0,
+                1.0,
+            )
+
+            candidates[0] = np.clip(
+                mean,
+                -1.0,
+                1.0,
+            )
+
+            costs, path, uncertainty = evaluate_candidate_batch(
+                state,
+                candidates,
+                target,
+                ensemble,
+                mode,
+                oracle_domain,
+            )
+
+            order = np.argsort(costs)
+
+            elite_indices = order[:CEM_ELITES]
+
+            elites = candidates[elite_indices]
+
+            if costs[order[0]] < best_cost:
+
+                best_cost = float(
+                    costs[order[0]]
+                )
+
+                best_sequence = candidates[
+                    order[0]
+                ].copy()
+
+                best_path = path.copy()
+
+                best_uncertainty = uncertainty.copy()
+
+            new_mean = np.mean(
+                elites,
+                axis=0,
+            )
+
+            new_std = (
+                np.std(elites, axis=0)
+                + CEM_MIN_STD
+            )
+
+            mean = (
+                CEM_SMOOTHING * mean
+                + (1.0 - CEM_SMOOTHING) * new_mean
+            )
+
+            std = (
+                CEM_SMOOTHING * std
+                + (1.0 - CEM_SMOOTHING) * new_std
+            )
+
+            std = np.clip(
+                std,
+                CEM_MIN_STD,
+                0.75,
+            )
+
+        self.warm_mean = best_sequence.copy()
+
+        self.last_path = best_path.copy()
+
+        self.last_uncertainty = best_uncertainty.copy()
+
+        return (
+            best_sequence[0].copy(),
+            best_path.copy(),
+            best_uncertainty.copy(),
+        )
 
 
 # ============================================================
-# 13. SIM-TO-REAL-STYLE BENCHMARK
+# 10. BENCHMARK
 # ============================================================
 
 def run_episode(
     ensemble,
     mode,
     domain,
-    wind_noise,
+    seed,
     steps=BENCHMARK_STEPS,
 ):
 
     env = DroneEnv(
-        domain=domain,
-        wind_noise=wind_noise,
+        domain,
+        WIND_NOISE_TEST,
     )
 
-    env.reset()
+    env.reset(seed=seed)
+
+    planner = CEMPlanner()
 
     distances = []
-    clearances = []
+    physical_clearances = []
+    safety_clearances = []
     efforts = []
 
-    collisions = 0
+    physical_collision_steps = 0
+    safety_violation_steps = 0
 
     for _ in range(steps):
 
@@ -1498,7 +1906,7 @@ def run_episode(
 
         else:
 
-            action, _, _ = choose_mpc_action(
+            action, _, _ = planner.plan(
                 state,
                 env.target,
                 ensemble,
@@ -1506,9 +1914,9 @@ def run_episode(
                 oracle_domain=domain,
             )
 
-        action = safety_filter(
+        action = predictive_safety_filter(
             action,
-            state[:2],
+            state,
         )
 
         env.step(action)
@@ -1517,43 +1925,65 @@ def run_episode(
             env.position - env.target.position()
         )
 
-        clearance = (
-            np.linalg.norm(
-                env.position - OBSTACLE
-            )
-            - OBSTACLE_RADIUS
+        obstacle_distance = np.linalg.norm(
+            env.position - OBSTACLE
         )
 
-        if clearance < 0:
-            collisions += 1
+        physical_clearance = (
+            obstacle_distance - OBSTACLE_RADIUS
+        )
+
+        safety_clearance = (
+            obstacle_distance - SAFE_RADIUS
+        )
+
+        physical_collision_steps += int(
+            physical_clearance < 0.0
+        )
+
+        safety_violation_steps += int(
+            safety_clearance < 0.0
+        )
 
         distances.append(distance)
-        clearances.append(clearance)
+
+        physical_clearances.append(
+            physical_clearance
+        )
+
+        safety_clearances.append(
+            safety_clearance
+        )
+
         efforts.append(
             np.linalg.norm(action)
         )
 
     return {
-        "mean_distance": float(
-            np.mean(distances)
+        "mean_distance": float(np.mean(distances)),
+        "terminal_distance": float(distances[-1]),
+        "minimum_physical_clearance": float(
+            np.min(physical_clearances)
         ),
-        "minimum_clearance": float(
-            np.min(clearances)
+        "minimum_safety_clearance": float(
+            np.min(safety_clearances)
         ),
-        "collision_steps": int(
-            collisions
+        "physical_collision_steps": float(
+            physical_collision_steps
         ),
-        "mean_effort": float(
-            np.mean(efforts)
+        "safety_violation_steps": float(
+            safety_violation_steps
         ),
+        "mean_effort": float(np.mean(efforts)),
     }
 
 
-def benchmark(
-    ensemble,
-    modes,
-    test_domains,
-):
+def benchmark(ensemble):
+
+    test_domains = [
+        NOMINAL_DOMAIN,
+        *unseen_test_domains(),
+    ]
 
     results = {}
 
@@ -1565,62 +1995,719 @@ def benchmark(
 
         results[domain["name"]] = {}
 
-        for mode in modes:
+        for mode in MODES:
 
             episode_results = []
 
-            for episode in range(
-                BENCHMARK_EPISODES
-            ):
+            for episode in range(BENCHMARK_EPISODES):
 
-                result = run_episode(
-                    ensemble,
-                    mode,
-                    domain,
-                    WIND_NOISE_TEST,
-                )
+                seed = 10000 + episode
 
                 episode_results.append(
-                    result
+                    run_episode(
+                        ensemble,
+                        mode,
+                        domain,
+                        seed=seed,
+                    )
                 )
 
             results[domain["name"]][mode] = {
                 key: float(
                     np.mean(
                         [
-                            item[key]
-                            for item in episode_results
+                            r[key]
+                            for r in episode_results
                         ]
                     )
                 )
                 for key in episode_results[0]
             }
 
+            m = results[domain["name"]][mode]
+
             print(
-                f"  {mode}: "
-                f"distance="
-                f"{results[domain['name']][mode]['mean_distance']:.2f}, "
-                f"clearance="
-                f"{results[domain['name']][mode]['minimum_clearance']:.2f}, "
-                f"collision steps="
-                f"{results[domain['name']][mode]['collision_steps']:.1f}"
+                f"  {mode:<24} "
+                f"distance={m['mean_distance']:.1f} "
+                f"terminal={m['terminal_distance']:.1f} "
+                f"physical_clearance="
+                f"{m['minimum_physical_clearance']:.1f} "
+                f"safety_clearance="
+                f"{m['minimum_safety_clearance']:.1f} "
+                f"collisions="
+                f"{m['physical_collision_steps']:.1f}"
             )
 
     return results
 
 
+def print_benchmark_table(results):
+
+    print("\n" + "=" * 125)
+
+    print("PAIRED ROBUST-MBRL BENCHMARK")
+
+    print("=" * 125)
+
+    for domain, values in results.items():
+
+        print(f"\nDOMAIN: {domain}")
+
+        print(
+            f"{'Controller':<24}"
+            f"{'Mean dist':>11}"
+            f"{'Final dist':>12}"
+            f"{'Physical clr':>14}"
+            f"{'Safety clr':>12}"
+            f"{'Collision':>11}"
+            f"{'Safety viol.':>13}"
+            f"{'Effort':>9}"
+        )
+
+        print("-" * 116)
+
+        for mode, m in values.items():
+
+            print(
+                f"{mode:<24}"
+                f"{m['mean_distance']:>11.1f}"
+                f"{m['terminal_distance']:>12.1f}"
+                f"{m['minimum_physical_clearance']:>14.1f}"
+                f"{m['minimum_safety_clearance']:>12.1f}"
+                f"{m['physical_collision_steps']:>11.1f}"
+                f"{m['safety_violation_steps']:>13.1f}"
+                f"{m['mean_effort']:>9.3f}"
+            )
+
+
 # ============================================================
-# 14. PYGAME QUADCOPTER VISUALIZATION
+# 11. VALIDATION REPORT
+# ============================================================
+
+def validation_report(ensemble):
+
+    x_val, y_val = ensemble.validation
+
+    limit = min(
+        10000,
+        len(x_val),
+    )
+
+    predictions = ensemble.predict_all(
+        x_val[:limit]
+    )
+
+    mean_prediction = np.mean(
+        predictions,
+        axis=0,
+    )
+
+    dimension_names = [
+        "delta_x",
+        "delta_y",
+        "delta_vx",
+        "delta_vy",
+        "delta_wind_x",
+        "delta_wind_y",
+    ]
+
+    print("\nHeld-out episode validation:")
+
+    print(
+        "Ensemble-mean RMSE by output dimension:"
+    )
+
+    errors = (
+        mean_prediction - y_val[:limit]
+    )
+
+    for i, name in enumerate(dimension_names):
+
+        rmse = float(
+            np.sqrt(
+                np.mean(errors[:, i] ** 2)
+            )
+        )
+
+        baseline = float(
+            np.sqrt(
+                np.mean(y_val[:limit, i] ** 2)
+            )
+        )
+
+        print(
+            f"  {name:<14} "
+            f"RMSE={rmse:9.4f} "
+            f"zero-predictor baseline={baseline:9.4f}"
+        )
+
+    overall_rmse = float(
+        np.sqrt(
+            np.mean(errors ** 2)
+        )
+    )
+
+    print(
+        f"Overall ensemble-mean RMSE: {overall_rmse:.5f}"
+    )
+
+    member_rmses = []
+
+    for i in range(MODEL_COUNT):
+
+        member_error = (
+            predictions[i] - y_val[:limit]
+        )
+
+        member_rmse = float(
+            np.sqrt(
+                np.mean(member_error ** 2)
+            )
+        )
+
+        member_rmses.append(member_rmse)
+
+        print(
+            f"  Member {i + 1} RMSE: {member_rmse:.5f}"
+        )
+
+    return overall_rmse, member_rmses
+
+
+# ============================================================
+# 12. VISUALIZATION
+# ============================================================
+
+def visualize_training(ensemble):
+
+    plt.figure(figsize=(10, 5))
+
+    for i, curve in enumerate(
+        ensemble.train_curves
+    ):
+
+        plt.plot(
+            curve,
+            label=f"Member {i + 1}",
+        )
+
+    plt.title(
+        "Dynamics Ensemble — Training Loss"
+    )
+
+    plt.xlabel("Epoch")
+
+    plt.ylabel(
+        "Normalized Smooth-L1 Loss"
+    )
+
+    plt.grid(True)
+
+    plt.legend()
+
+    plt.tight_layout()
+
+    plt.show()
+
+    plt.figure(figsize=(10, 5))
+
+    for i, curve in enumerate(
+        ensemble.val_curves
+    ):
+
+        plt.plot(
+            curve,
+            label=f"Member {i + 1}",
+        )
+
+    plt.title(
+        "Dynamics Ensemble — Episode-Held-Out Validation Loss"
+    )
+
+    plt.xlabel("Epoch")
+
+    plt.ylabel(
+        "Normalized Smooth-L1 Loss"
+    )
+
+    plt.grid(True)
+
+    plt.legend()
+
+    plt.tight_layout()
+
+    plt.show()
+
+
+def visualize_benchmark(results):
+
+    metrics = [
+        (
+            "mean_distance",
+            "Mean target distance",
+        ),
+        (
+            "minimum_physical_clearance",
+            "Minimum physical-obstacle clearance",
+        ),
+        (
+            "safety_violation_steps",
+            "Safety-boundary violation steps",
+        ),
+    ]
+
+    modes = list(
+        next(iter(results.values())).keys()
+    )
+
+    domains = list(results.keys())
+
+    for metric, title in metrics:
+
+        plt.figure(figsize=(13, 5))
+
+        x = np.arange(len(domains))
+
+        width = 0.18
+
+        for i, mode in enumerate(modes):
+
+            values = [
+                results[d][mode][metric]
+                for d in domains
+            ]
+
+            plt.bar(
+                x + i * width,
+                values,
+                width,
+                label=mode,
+            )
+
+        plt.xticks(
+            x + width * 1.5,
+            domains,
+            rotation=15,
+        )
+
+        plt.title(title)
+
+        plt.ylabel(title)
+
+        plt.grid(axis="y")
+
+        plt.legend()
+
+        plt.tight_layout()
+
+        plt.show()
+
+
+# ============================================================
+# 13. UNIT TESTS
+# ============================================================
+
+def run_tests(ensemble):
+
+    print("\nRunning unit tests...")
+
+    passed = 0
+    total = 0
+
+    failures = []
+
+    def check(condition, description):
+
+        nonlocal passed, total
+
+        total += 1
+
+        if bool(condition):
+
+            passed += 1
+
+            print(
+                f"[PASS] {description}"
+            )
+
+        else:
+
+            failures.append(description)
+
+            print(
+                f"[FAIL] {description}"
+            )
+
+    env = DroneEnv(NOMINAL_DOMAIN)
+
+    state = env.reset(seed=123)
+
+    check(
+        state.shape == (6,),
+        "State has six dimensions",
+    )
+
+    check(
+        np.all(np.isfinite(state)),
+        "Initial state is finite",
+    )
+
+    delta = env.step_drone(
+        np.zeros(2, dtype=np.float32)
+    )
+
+    check(
+        delta.shape == (6,),
+        "Transition delta has six dimensions",
+    )
+
+    check(
+        np.all(np.isfinite(delta)),
+        "Transition delta is finite",
+    )
+
+    check(
+        np.linalg.norm(env.velocity) <= MAX_SPEED + 1e-4,
+        "Drone speed is bounded",
+    )
+
+    check(
+        np.all(np.abs(env.wind) <= 55.0),
+        "Wind is bounded",
+    )
+
+    previous_target = (
+        env.target.position().copy()
+    )
+
+    env.target.advance()
+
+    check(
+        not np.allclose(
+            previous_target,
+            env.target.position(),
+        ),
+        "Moving target advances",
+    )
+
+    action = pd_controller(
+        env.state(),
+        env.target.position(),
+        env.target.velocity(),
+    )
+
+    check(
+        action.shape == (2,)
+        and np.all(np.abs(action) <= 1.0),
+        "PD action is bounded",
+    )
+
+    safe_action = predictive_safety_filter(
+        action,
+        env.state(),
+    )
+
+    check(
+        safe_action.shape == (2,)
+        and np.all(np.abs(safe_action) <= 1.0),
+        "Safety-filter output is bounded",
+    )
+
+    params = domain_vector(
+        random_domain()
+    )
+
+    check(
+        params.shape == (3,)
+        and np.all(np.isfinite(params)),
+        "Randomized domain vector is valid",
+    )
+
+    sample_input = np.concatenate(
+        [
+            env.state(),
+            np.zeros(2),
+            domain_vector(NOMINAL_DOMAIN),
+        ]
+    ).astype(np.float32)
+
+    # --------------------------------------------------------
+    # SINGLE-INPUT ENSEMBLE TEST
+    # --------------------------------------------------------
+
+    predictions = ensemble.predict_all(
+        sample_input
+    )
+
+    check(
+        predictions.shape == (MODEL_COUNT, OUTPUT_SIZE),
+        "Single-input ensemble prediction has correct shape",
+    )
+
+    check(
+        np.all(np.isfinite(predictions)),
+        "Single-input predictions are finite",
+    )
+
+    # --------------------------------------------------------
+    # BATCH ENSEMBLE TEST
+    # --------------------------------------------------------
+
+    batch_inputs = np.repeat(
+        sample_input[None, :],
+        4,
+        axis=0,
+    )
+
+    batch_predictions = ensemble.predict_all(
+        batch_inputs
+    )
+
+    check(
+        batch_predictions.shape == (
+            MODEL_COUNT,
+            4,
+            OUTPUT_SIZE,
+        ),
+        "Batched ensemble prediction has correct shape",
+    )
+
+    # --------------------------------------------------------
+    # VALIDATION-BATCH SHAPE TEST
+    # --------------------------------------------------------
+
+    large_batch = np.repeat(
+        sample_input[None, :],
+        100,
+        axis=0,
+    )
+
+    large_predictions = ensemble.predict_all(
+        large_batch
+    )
+
+    check(
+        large_predictions.shape == (
+            MODEL_COUNT,
+            100,
+            OUTPUT_SIZE,
+        ),
+        "Large validation batch has correct shape",
+    )
+
+    # --------------------------------------------------------
+    # NOMINAL SEQUENCE TEST
+    # --------------------------------------------------------
+
+    nominal = make_nominal_sequence(
+        env.state(),
+        env.target,
+    )
+
+    check(
+        nominal.shape == (
+            MPC_HORIZON,
+            2,
+        ),
+        "Nominal action sequence has correct shape",
+    )
+
+    check(
+        np.all(np.abs(nominal) <= 1.0),
+        "Nominal action sequence is bounded",
+    )
+
+    # --------------------------------------------------------
+    # ROBUST MPC TEST
+    # --------------------------------------------------------
+
+    candidates = np.repeat(
+        nominal[None, :, :],
+        3,
+        axis=0,
+    )
+
+    costs, path, uncertainty = evaluate_candidate_batch(
+        env.state(),
+        candidates,
+        env.target,
+        ensemble,
+        "Robust Ensemble MPC",
+    )
+
+    check(
+        costs.shape == (3,),
+        "Robust MPC returns one cost per candidate",
+    )
+
+    check(
+        path.shape == (
+            MPC_HORIZON,
+            2,
+        ),
+        "Robust MPC returns a full predicted path",
+    )
+
+    check(
+        uncertainty.shape == (
+            MPC_HORIZON,
+        ),
+        "Robust MPC returns horizon uncertainty",
+    )
+
+    check(
+        np.all(np.isfinite(costs))
+        and np.all(np.isfinite(path))
+        and np.all(np.isfinite(uncertainty)),
+        "Robust MPC outputs are finite",
+    )
+
+    # --------------------------------------------------------
+    # INDEPENDENT MEMBER ROLLOUT TEST
+    # --------------------------------------------------------
+
+    initial_states = np.repeat(
+        env.state()[None, None, :],
+        MODEL_COUNT * 3,
+        axis=0,
+    ).reshape(
+        MODEL_COUNT,
+        3,
+        6,
+    )
+
+    test_actions = np.zeros(
+        (3, 2),
+        dtype=np.float32,
+    )
+
+    independent_predictions = (
+        learned_transition_independent_members(
+            ensemble,
+            initial_states,
+            test_actions,
+            NOMINAL_DOMAIN,
+        )
+    )
+
+    check(
+        independent_predictions.shape == (
+            MODEL_COUNT,
+            3,
+            6,
+        ),
+        "Independent ensemble rollouts have correct shape",
+    )
+
+    check(
+        np.all(np.isfinite(independent_predictions)),
+        "Independent ensemble rollouts are finite",
+    )
+
+    # --------------------------------------------------------
+    # CEM TEST
+    # --------------------------------------------------------
+
+    planner = CEMPlanner()
+
+    planned_action, planned_path, planned_uncertainty = (
+        planner.plan(
+            env.state(),
+            env.target,
+            ensemble,
+            "Robust Ensemble MPC",
+        )
+    )
+
+    check(
+        planned_action.shape == (2,)
+        and np.all(np.abs(planned_action) <= 1.0),
+        "CEM planner returns a bounded action",
+    )
+
+    check(
+        planned_path.shape == (
+            MPC_HORIZON,
+            2,
+        ),
+        "CEM planner returns a predicted trajectory",
+    )
+
+    check(
+        planned_uncertainty.shape == (
+            MPC_HORIZON,
+        ),
+        "CEM planner returns uncertainty values",
+    )
+
+    # --------------------------------------------------------
+    # REPRODUCIBILITY TEST
+    # --------------------------------------------------------
+
+    env_a = DroneEnv(
+        NOMINAL_DOMAIN,
+        WIND_NOISE_TEST,
+    )
+
+    env_b = DroneEnv(
+        NOMINAL_DOMAIN,
+        WIND_NOISE_TEST,
+    )
+
+    state_a = env_a.reset(seed=999)
+    state_b = env_b.reset(seed=999)
+
+    check(
+        np.allclose(state_a, state_b),
+        "Same reset seed produces identical initial drone state",
+    )
+
+    check(
+        np.isclose(
+            env_a.target.phase,
+            env_b.target.phase,
+        ),
+        "Same reset seed produces identical target phase",
+    )
+
+    print(
+        f"\n{passed}/{total} tests passed."
+    )
+
+    if failures:
+
+        print("Failed tests:")
+
+        for failure in failures:
+
+            print(" -", failure)
+
+        return False
+
+    print(
+        "[SUCCESS] All unit tests passed."
+    )
+
+    return True
+
+
+# ============================================================
+# 14. PYGAME VISUALIZATION
 # ============================================================
 
 def run_pygame(ensemble):
 
     try:
+
         import pygame
+
     except ImportError:
+
         print(
-            "Install Pygame with: pip install pygame"
+            "Pygame is not installed. "
+            "Run: pip install pygame"
         )
+
         return
 
     pygame.init()
@@ -1630,7 +2717,7 @@ def run_pygame(ensemble):
     )
 
     pygame.display.set_caption(
-        "Phase 4.20 — Robust Model-Based Drone"
+        "Phase 4.20 — Robust MBRL Quadcopter"
     )
 
     clock = pygame.time.Clock()
@@ -1640,30 +2727,28 @@ def run_pygame(ensemble):
         16,
     )
 
-    domain = dict(DOMAINS[2])
+    domain = dict(NOMINAL_DOMAIN)
 
     env = DroneEnv(
-        domain=domain,
-        wind_noise=WIND_NOISE_TEST,
+        domain,
+        WIND_NOISE_TEST,
     )
 
-    env.reset()
+    env.reset(seed=2026)
 
-    modes = [
-        "PD",
-        "Nominal MPC",
-        "Robust Ensemble MPC",
-        "Oracle MPC",
-    ]
+    planner = CEMPlanner()
 
     mode_index = 2
 
     paused = False
+
     speed = 1
 
     trail = []
+
     planned_path = []
-    planned_uncertainty = np.zeros(0)
+
+    uncertainty = np.zeros(0)
 
     last_action = np.zeros(
         2,
@@ -1686,37 +2771,46 @@ def run_pygame(ensemble):
             (x, y),
         )
 
-    def draw_drone(position, velocity):
+    def draw_quadcopter(position, velocity):
 
         center = np.asarray(
-            position
+            position,
+            dtype=np.float32,
         )
 
-        direction = velocity / (
-            np.linalg.norm(velocity) + 1e-6
+        speed_now = np.linalg.norm(
+            velocity
         )
+
+        if speed_now > 1.0:
+
+            direction = velocity / speed_now
+
+        else:
+
+            direction = np.array(
+                [1.0, 0.0],
+                dtype=np.float32,
+            )
 
         side = np.array(
-            [
-                -direction[1],
-                direction[0],
-            ]
+            [-direction[1], direction[0]],
+            dtype=np.float32,
         )
 
-        for forward in (-1, 1):
+        for forward in (-1.0, 1.0):
 
-            for lateral in (-1, 1):
+            for lateral in (-1.0, 1.0):
 
-                offset = (
-                    direction * forward * 17
-                    + side * lateral * 17
+                endpoint = (
+                    center
+                    + forward * direction * 18.0
+                    + lateral * side * 18.0
                 )
-
-                endpoint = center + offset
 
                 pygame.draw.line(
                     screen,
-                    (210, 220, 235),
+                    (215, 225, 238),
                     center.astype(int),
                     endpoint.astype(int),
                     5,
@@ -1726,7 +2820,7 @@ def run_pygame(ensemble):
                     screen,
                     (90, 195, 245),
                     endpoint.astype(int),
-                    7,
+                    8,
                     2,
                 )
 
@@ -1734,15 +2828,13 @@ def run_pygame(ensemble):
             screen,
             (245, 245, 245),
             center.astype(int),
-            8,
+            9,
         )
-
-        nose = center + direction * 22
 
         pygame.draw.circle(
             screen,
             (255, 190, 60),
-            nose.astype(int),
+            (center + direction * 23.0).astype(int),
             4,
         )
 
@@ -1750,17 +2842,15 @@ def run_pygame(ensemble):
 
         points = []
 
-        for i in range(100):
+        for i in range(120):
 
             phase = (
                 env.target.phase
-                + i * 2.0 * math.pi / 100
+                + i * 2.0 * math.pi / 120
             )
 
             points.append(
-                env.target.position(
-                    phase
-                ).astype(int)
+                env.target.position(phase).astype(int)
             )
 
         pygame.draw.lines(
@@ -1772,6 +2862,7 @@ def run_pygame(ensemble):
         )
 
         position = env.target.position()
+
         velocity = env.target.velocity()
 
         pygame.draw.circle(
@@ -1793,10 +2884,16 @@ def run_pygame(ensemble):
             screen,
             (80, 255, 130),
             position.astype(int),
-            (
-                position + velocity * 0.2
-            ).astype(int),
+            (position + velocity * 0.2).astype(int),
             3,
+        )
+
+        pygame.draw.circle(
+            screen,
+            (80, 255, 130),
+            env.target.center.astype(int),
+            5,
+            1,
         )
 
     running = True
@@ -1808,23 +2905,30 @@ def run_pygame(ensemble):
         for event in pygame.event.get():
 
             if event.type == pygame.QUIT:
+
                 running = False
 
             elif event.type == pygame.KEYDOWN:
 
                 if event.key == pygame.K_ESCAPE:
+
                     running = False
 
                 elif event.key == pygame.K_SPACE:
+
                     paused = not paused
 
                 elif event.key == pygame.K_r:
 
                     env.reset()
+
                     trail.clear()
 
+                    planner.reset()
+
                     planned_path = []
-                    planned_uncertainty = np.zeros(0)
+
+                    uncertainty = np.zeros(0)
 
                 elif event.key in (
                     pygame.K_EQUALS,
@@ -1844,16 +2948,28 @@ def run_pygame(ensemble):
                     )
 
                 elif event.key == pygame.K_1:
+
                     mode_index = 0
 
+                    planner.reset()
+
                 elif event.key == pygame.K_2:
+
                     mode_index = 1
 
+                    planner.reset()
+
                 elif event.key == pygame.K_3:
+
                     mode_index = 2
 
+                    planner.reset()
+
                 elif event.key == pygame.K_4:
+
                     mode_index = 3
+
+                    planner.reset()
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
 
@@ -1864,13 +2980,18 @@ def run_pygame(ensemble):
                         dtype=np.float32,
                     )
 
-                    if np.linalg.norm(
-                        click - OBSTACLE
-                    ) > SAFE_RADIUS + 15:
+                    if (
+                        np.linalg.norm(click - OBSTACLE)
+                        > SAFE_RADIUS + 30
+                        and 180 < click[0] < WORLD_W - 180
+                        and 130 < click[1] < WORLD_H - 130
+                    ):
 
                         env.target.center = click
 
-        mode = modes[mode_index]
+                        planner.reset()
+
+        mode = MODES[mode_index]
 
         if not paused:
 
@@ -1887,15 +3008,12 @@ def run_pygame(ensemble):
                     )
 
                     planned_path = []
-                    planned_uncertainty = np.zeros(0)
+
+                    uncertainty = np.zeros(0)
 
                 else:
 
-                    (
-                        action,
-                        planned_path,
-                        planned_uncertainty,
-                    ) = choose_mpc_action(
+                    action, planned_path, uncertainty = planner.plan(
                         state,
                         env.target,
                         ensemble,
@@ -1903,9 +3021,9 @@ def run_pygame(ensemble):
                         oracle_domain=domain,
                     )
 
-                action = safety_filter(
+                action = predictive_safety_filter(
                     action,
-                    state[:2],
+                    state,
                 )
 
                 last_action = action.copy()
@@ -1916,19 +3034,15 @@ def run_pygame(ensemble):
                     env.position.copy()
                 )
 
-                if len(trail) > 160:
+                if len(trail) > 180:
+
                     trail.pop(0)
 
-        # Background.
         screen.fill(
             (18, 24, 34)
         )
 
-        for x in range(
-            0,
-            WORLD_W,
-            50,
-        ):
+        for x in range(0, WORLD_W, 50):
 
             pygame.draw.line(
                 screen,
@@ -1937,11 +3051,7 @@ def run_pygame(ensemble):
                 (x, WORLD_H),
             )
 
-        for y in range(
-            0,
-            WORLD_H,
-            50,
-        ):
+        for y in range(0, WORLD_H, 50):
 
             pygame.draw.line(
                 screen,
@@ -1950,7 +3060,6 @@ def run_pygame(ensemble):
                 (WORLD_W, y),
             )
 
-        # Obstacle and safety radius.
         pygame.draw.circle(
             screen,
             (95, 95, 105),
@@ -1994,16 +3103,16 @@ def run_pygame(ensemble):
                 3,
             )
 
-            for point, uncertainty in zip(
+            for point, spread in zip(
                 planned_path,
-                planned_uncertainty,
+                uncertainty,
             ):
 
                 radius = int(
                     np.clip(
-                        uncertainty * 1.3,
+                        spread * 1.2,
                         2,
-                        40,
+                        35,
                     )
                 )
 
@@ -2015,19 +3124,25 @@ def run_pygame(ensemble):
                     1,
                 )
 
-        draw_drone(
+        draw_quadcopter(
             env.position,
             env.velocity,
         )
 
-        distance = np.linalg.norm(
+        target_distance = np.linalg.norm(
             env.position - env.target.position()
         )
 
-        clearance = (
-            np.linalg.norm(
-                env.position - OBSTACLE
-            ) - OBSTACLE_RADIUS
+        obstacle_distance = np.linalg.norm(
+            env.position - OBSTACLE
+        )
+
+        physical_clearance = (
+            obstacle_distance - OBSTACLE_RADIUS
+        )
+
+        safety_clearance = (
+            obstacle_distance - SAFE_RADIUS
         )
 
         draw_text(
@@ -2037,41 +3152,45 @@ def run_pygame(ensemble):
         )
 
         draw_text(
-            f"Target distance: {distance:.1f}px",
+            f"Target distance: {target_distance:.1f}px",
             15,
             38,
         )
 
         draw_text(
-            f"Obstacle clearance: {clearance:.1f}px",
+            f"Physical clearance: {physical_clearance:.1f}px",
             15,
             64,
         )
 
         draw_text(
-            f"Wind: [{env.wind[0]:+.1f}, "
-            f"{env.wind[1]:+.1f}]",
+            f"Safety clearance: {safety_clearance:.1f}px",
             15,
             90,
         )
 
         draw_text(
-            f"Action: [{last_action[0]:+.2f}, "
-            f"{last_action[1]:+.2f}]",
+            f"Wind: [{env.wind[0]:+.1f}, {env.wind[1]:+.1f}]",
             15,
             116,
         )
 
         draw_text(
-            f"Simulation speed: {speed}x",
+            f"Action: [{last_action[0]:+.2f}, {last_action[1]:+.2f}]",
             15,
             142,
         )
 
         draw_text(
-            "Gold circles: disagreement across domain predictions",
+            f"Simulation speed: {speed}x",
             15,
             168,
+        )
+
+        draw_text(
+            "Gold rings: ensemble trajectory disagreement",
+            15,
+            194,
             (245, 195, 110),
         )
 
@@ -2082,8 +3201,7 @@ def run_pygame(ensemble):
         )
 
         draw_text(
-            "SPACE pause | R reset | +/- speed | "
-            "click target center | ESC exit",
+            "SPACE pause | R reset | +/- speed | click orbit center | ESC exit",
             15,
             WORLD_H - 45,
         )
@@ -2103,528 +3221,77 @@ def run_pygame(ensemble):
 
 
 # ============================================================
-# 15. VISUALIZATION
-# ============================================================
-
-def visualize_training(ensemble):
-
-    plt.figure(figsize=(9, 5))
-
-    for index, domain in enumerate(DOMAINS):
-
-        plt.plot(
-            ensemble.train_curves[index],
-            label=domain["name"],
-        )
-
-    plt.xlabel("Epoch")
-    plt.ylabel("Normalized MSE")
-    plt.title("Domain-Specific Dynamics Model Training")
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
-    plt.figure(figsize=(9, 5))
-
-    for index, domain in enumerate(DOMAINS):
-
-        plt.plot(
-            ensemble.validation_curves[index],
-            label=domain["name"],
-        )
-
-    plt.xlabel("Epoch")
-    plt.ylabel("Validation MSE")
-    plt.title("Held-Out Validation Loss by Domain")
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
-
-def visualize_benchmark(results):
-
-    domain_names = list(
-        results.keys()
-    )
-
-    modes = [
-        "PD",
-        "Nominal MPC",
-        "Robust Ensemble MPC",
-        "Oracle MPC",
-    ]
-
-    metrics = [
-        (
-            "mean_distance",
-            "Mean target distance (pixels)",
-        ),
-        (
-            "minimum_clearance",
-            "Minimum obstacle clearance (pixels)",
-        ),
-        (
-            "collision_steps",
-            "Collision steps per episode",
-        ),
-    ]
-
-    for metric, title in metrics:
-
-        plt.figure(figsize=(11, 5))
-
-        x = np.arange(
-            len(domain_names)
-        )
-
-        width = 0.18
-
-        for i, mode in enumerate(modes):
-
-            values = [
-                results[domain][mode][metric]
-                for domain in domain_names
-            ]
-
-            plt.bar(
-                x + i * width,
-                values,
-                width,
-                label=mode,
-            )
-
-        plt.xticks(
-            x + width * 1.5,
-            domain_names,
-            rotation=15,
-        )
-
-        plt.title(title)
-        plt.ylabel(title)
-        plt.grid(axis="y")
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
-
-def print_benchmark_table(results):
-
-    print("\n" + "=" * 100)
-    print("SIM-TO-REAL-STYLE BENCHMARK")
-    print("=" * 100)
-
-    for domain, domain_results in results.items():
-
-        print(f"\nDOMAIN: {domain}")
-
-        print(
-            f"{'Controller':<25}"
-            f"{'Distance':>13}"
-            f"{'Clearance':>14}"
-            f"{'Collision':>13}"
-            f"{'Effort':>12}"
-        )
-
-        print("-" * 80)
-
-        for mode, metrics in domain_results.items():
-
-            print(
-                f"{mode:<25}"
-                f"{metrics['mean_distance']:>13.2f}"
-                f"{metrics['minimum_clearance']:>14.2f}"
-                f"{metrics['collision_steps']:>13.2f}"
-                f"{metrics['mean_effort']:>12.3f}"
-            )
-
-
-# ============================================================
-# 16. UNIT TESTS
-# ============================================================
-
-def run_tests(ensemble=None):
-
-    print("\nRunning tests...")
-
-    passed = 0
-
-    def check(condition, description):
-
-        nonlocal passed
-
-        assert condition, description
-
-        passed += 1
-
-        print(
-            f"[PASS] {description}"
-        )
-
-    # Test 1
-    check(
-        len(DOMAINS) == MODEL_COUNT,
-        "Domain count matches model count",
-    )
-
-    # Test 2
-    check(
-        all(
-            domain["mass"] > 0
-            and domain["drag"] >= 0
-            and domain["accel"] > 0
-            for domain in DOMAINS
-        ),
-        "All domain parameters are physically valid",
-    )
-
-    target = MovingTarget(
-        np.array(
-            [400.0, 300.0],
-            dtype=np.float32,
-        )
-    )
-
-    # Test 3
-    check(
-        target.position().shape == (2,),
-        "Moving target position has two dimensions",
-    )
-
-    # Test 4
-    check(
-        target.velocity().shape == (2,),
-        "Moving target velocity has two dimensions",
-    )
-
-    # Test 5
-    previous = target.position().copy()
-    target.advance()
-
-    check(
-        not np.allclose(
-            previous,
-            target.position(),
-        ),
-        "Moving target advances",
-    )
-
-    env = DroneEnv(
-        domain=DOMAINS[2]
-    )
-
-    # Test 6
-    check(
-        env.state().shape == (6,),
-        "Drone state includes position, velocity and wind",
-    )
-
-    # Test 7
-    delta = env.step_drone(
-        np.zeros(2, dtype=np.float32)
-    )
-
-    check(
-        delta.shape == (6,),
-        "Environment returns six state differences",
-    )
-
-    # Test 8
-    env.step_drone(
-        np.array(
-            [5.0, -5.0],
-            dtype=np.float32,
-        )
-    )
-
-    check(
-        np.linalg.norm(env.velocity)
-        <= MAX_SPEED + 1e-4,
-        "Drone speed is bounded",
-    )
-
-    # Test 9
-    check(
-        np.all(np.isfinite(env.state())),
-        "Drone state remains finite",
-    )
-
-    # Test 10
-    check(
-        np.all(np.abs(env.wind) <= 55.0),
-        "Wind disturbance remains bounded",
-    )
-
-    # Test 11
-    action = pd_controller(
-        env.state(),
-        env.target.position(),
-        env.target.velocity(),
-    )
-
-    check(
-        action.shape == (2,)
-        and np.all(np.abs(action) <= 1.0),
-        "PD action has correct shape and bounds",
-    )
-
-    # Test 12
-    corrected = safety_filter(
-        np.zeros(2, dtype=np.float32),
-        OBSTACLE + np.array(
-            [30.0, 0.0],
-            dtype=np.float32,
-        ),
-    )
-
-    check(
-        np.all(np.abs(corrected) <= 1.0),
-        "Safety correction remains bounded",
-    )
-
-    # Test 13
-    domain = random_domain()
-
-    check(
-        0.75 <= domain["mass"] <= 1.40
-        and 0.025 <= domain["drag"] <= 0.13
-        and 0.78 <= domain["accel"] <= 1.22,
-        "Randomized parameters stay within configured ranges",
-    )
-
-    # Test 14
-    nominal = make_nominal_sequence(
-        env.state(),
-        env.target,
-    )
-
-    check(
-        nominal.shape == (
-            MPC_HORIZON,
-            2,
-        ),
-        "Nominal MPC sequence has correct shape",
-    )
-
-    # Test 15
-    check(
-        np.all(np.abs(nominal) <= 1.0),
-        "Nominal MPC actions are bounded",
-    )
-
-    # Test 16
-    if ensemble is not None:
-
-        sample = np.concatenate(
-            [
-                env.state(),
-                np.zeros(2, dtype=np.float32),
-            ]
-        )
-
-        prediction = ensemble.predict_all(
-            sample
-        )
-
-        check(
-            prediction.shape == (
-                MODEL_COUNT,
-                6,
-            ),
-            "Every domain model produces a six-dimensional prediction",
-        )
-
-        # Test 17
-        check(
-            np.all(np.isfinite(prediction)),
-            "Domain ensemble predictions are finite",
-        )
-
-        # Test 18
-        test_candidates = np.repeat(
-            nominal[None, :, :],
-            3,
-            axis=0,
-        )
-
-        robust_cost, robust_path, uncertainty = (
-            evaluate_candidates(
-                env.state(),
-                test_candidates,
-                env.target,
-                ensemble,
-                "Robust Ensemble MPC",
-            )
-        )
-
-        check(
-            robust_cost.shape == (3,)
-            and robust_path.shape == (
-                MPC_HORIZON,
-                2,
-            )
-            and uncertainty.shape == (
-                MPC_HORIZON,
-            )
-            and np.all(np.isfinite(robust_cost)),
-            "Robust ensemble rollout returns valid results",
-        )
-
-        # Test 19
-        nominal_cost, nominal_path, _ = (
-            evaluate_candidates(
-                env.state(),
-                test_candidates,
-                env.target,
-                ensemble,
-                "Nominal MPC",
-            )
-        )
-
-        check(
-            nominal_cost.shape == (3,)
-            and nominal_path.shape == (
-                MPC_HORIZON,
-                2,
-            ),
-            "Nominal MPC rollout returns valid results",
-        )
-
-        # Test 20
-        oracle_cost, oracle_path, _ = (
-            evaluate_candidates(
-                env.state(),
-                test_candidates,
-                env.target,
-                ensemble,
-                "Oracle MPC",
-                oracle_domain=DOMAINS[2],
-            )
-        )
-
-        check(
-            oracle_cost.shape == (3,)
-            and oracle_path.shape == (
-                MPC_HORIZON,
-                2,
-            ),
-            "Oracle MPC rollout returns valid results",
-        )
-
-    else:
-
-        for number in range(16, 21):
-
-            check(
-                True,
-                f"Test {number} skipped before model training",
-            )
-
-    print(
-        f"\n{passed}/20 tests passed."
-    )
-
-    return passed == 20
-
-
-# ============================================================
-# 17. MAIN
+# 15. MAIN
 # ============================================================
 
 def main():
 
-    print("=" * 76)
+    print("=" * 80)
 
     print(
         "PHASE 4.20 — ROBUST MODEL-BASED RL"
     )
 
-    print(
-        "DOMAIN RANDOMIZATION / DISTURBANCE MODELING / SIM-TO-REAL"
-    )
-
-    print("=" * 76)
+    print("=" * 80)
 
     print(
         "Device:",
         DEVICE,
     )
 
-    # --------------------------------------------------------
-    # STEP 1 — Collect domain-randomized datasets
-    # --------------------------------------------------------
-
     print(
-        "\n[1/7] Collecting domain-randomized data..."
+        f"Training episodes: {DATA_EPISODES} | "
+        f"Transitions: "
+        f"{DATA_EPISODES * STEPS_PER_EPISODE:,}"
     )
 
-    datasets = []
-
-    for domain in DOMAINS:
-
-        print(
-            f"Collecting: {domain['name']}"
-        )
-
-        dataset = collect_domain_data(
-            domain
-        )
-
-        datasets.append(dataset)
-
-        print(
-            f"  Transitions: {len(dataset[0]):,}"
-        )
-
-    # --------------------------------------------------------
-    # STEP 2 — Train one model per domain
-    # --------------------------------------------------------
-
     print(
-        "\n[2/7] Training domain-specific dynamics models..."
+        f"Ensemble members: {MODEL_COUNT} | "
+        f"CEM candidates: {CEM_CANDIDATES} | "
+        f"Horizon: {MPC_HORIZON}"
     )
 
-    ensemble = DomainEnsemble()
+    # STEP 1
+    print(
+        "\n[1/7] Collecting randomized dynamics data..."
+    )
+
+    x, y, episode_ids = collect_data()
+
+    print(
+        f"Input shape: {x.shape}"
+    )
+
+    print(
+        f"Target shape: {y.shape}"
+    )
+
+    print(
+        f"Unique episodes: "
+        f"{len(np.unique(episode_ids))}"
+    )
+
+    # STEP 2
+    print(
+        "\n[2/7] Training bootstrapped dynamics ensemble..."
+    )
+
+    ensemble = DynamicsEnsemble()
 
     ensemble.train(
-        datasets
+        x,
+        y,
+        episode_ids,
     )
 
-    # --------------------------------------------------------
-    # STEP 3 — Verify predictions
-    # --------------------------------------------------------
-
+    # STEP 3
     print(
-        "\n[3/7] Checking model predictions..."
+        "\n[3/7] Evaluating episode-held-out predictions..."
     )
 
-    for index, domain in enumerate(DOMAINS):
+    validation_report(ensemble)
 
-        x_val, y_val = (
-            ensemble.validation_data[index]
-        )
-
-        prediction = ensemble.predict_member(
-            index,
-            x_val,
-        )
-
-        rmse = np.sqrt(
-            np.mean(
-                (prediction - y_val) ** 2
-            )
-        )
-
-        print(
-            f"{domain['name']:<22} "
-            f"validation RMSE={rmse:.6f}"
-        )
-
-    # --------------------------------------------------------
-    # STEP 4 — Unit tests
-    # --------------------------------------------------------
-
+    # STEP 4
     print(
         "\n[4/7] Running unit tests..."
     )
@@ -2632,67 +3299,35 @@ def main():
     if not run_tests(ensemble):
 
         raise RuntimeError(
-            "Unit tests failed."
+            "One or more unit tests failed."
         )
 
-    # --------------------------------------------------------
-    # STEP 5 — Benchmark on nominal and unseen domains
-    # --------------------------------------------------------
-
+    # STEP 5
     print(
-        "\n[5/7] Evaluating robustness..."
+        "\n[5/7] Running paired robustness benchmark..."
     )
 
-    test_domains = [
-        DOMAINS[2],
-        *unseen_test_domains(),
-    ]
+    results = benchmark(ensemble)
 
-    modes = [
-        "PD",
-        "Nominal MPC",
-        "Robust Ensemble MPC",
-        "Oracle MPC",
-    ]
+    print_benchmark_table(results)
 
-    results = benchmark(
-        ensemble,
-        modes,
-        test_domains,
-    )
-
-    print_benchmark_table(
-        results
-    )
-
-    # --------------------------------------------------------
-    # STEP 6 — Visualizations
-    # --------------------------------------------------------
-
+    # STEP 6
     print(
         "\n[6/7] Showing training and benchmark plots..."
     )
 
-    visualize_training(
-        ensemble
-    )
+    visualize_training(ensemble)
 
-    visualize_benchmark(
-        results
-    )
+    visualize_benchmark(results)
 
-    # --------------------------------------------------------
-    # STEP 7 — Interactive drone
-    # --------------------------------------------------------
-
+    # STEP 7
     print(
-        "\n[7/7] Opening interactive drone visualization..."
+        "\n[7/7] Opening interactive quadcopter visualization..."
     )
 
-    run_pygame(
-        ensemble
-    )
+    run_pygame(ensemble)
 
 
 if __name__ == "__main__":
+
     main()
