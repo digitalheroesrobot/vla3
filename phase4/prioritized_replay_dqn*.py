@@ -1236,6 +1236,12 @@ class RocketGUI:
             font = self.font
 
         surface = font.render(str(message), True, color)
+
+        # Pygame blit requires integer destination coordinates.
+        # Convert NumPy floats and Python floats to integers.
+        x = int(x)
+        y = int(y)
+
         self.screen.blit(surface, (x, y))
 
     def draw_rocket(self, x, y):

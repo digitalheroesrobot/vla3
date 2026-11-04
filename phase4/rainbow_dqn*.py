@@ -825,91 +825,82 @@ def project_distribution(
     gamma_n,
 ):
     """
-    Project the Bellman-updated categorical distribution
-    onto the fixed support [V_MIN, V_MAX].
+    C51 categorical Bellman projection.
 
-    Tz = reward + gamma^n * (1-terminal) * z
-
-    b = (Tz - V_MIN) / delta_z
-
-    Probability mass is distributed between floor(b)
-    and ceil(b).
-
-    The l == u case is handled explicitly so probability
-    mass is not accidentally lost at exact atom locations.
+    Each source atom contributes probability mass to the two
+    neighboring destination atoms. Destination indices must be
+    offset by the batch row; otherwise every batch item writes into
+    the first row and later rows lose their probability mass.
     """
+    if next_probabilities.ndim != 2:
+        raise ValueError(
+            "next_probabilities must have shape [batch, NUM_ATOMS]."
+        )
 
-    batch_size = next_probabilities.shape[0]
+    batch_size, atom_count = next_probabilities.shape
+    if atom_count != NUM_ATOMS:
+        raise ValueError(
+            f"Expected {NUM_ATOMS} atoms, received {atom_count}."
+        )
 
-    rewards = rewards.unsqueeze(1)
-    terminated = terminated.unsqueeze(1)
-    gamma_n = gamma_n.unsqueeze(1)
-
-    support = SUPPORT.unsqueeze(0).expand(
-        batch_size,
-        NUM_ATOMS,
+    rewards = rewards.reshape(batch_size, 1)
+    terminated = terminated.reshape(batch_size, 1).to(
+        dtype=next_probabilities.dtype
     )
+    gamma_n = gamma_n.reshape(batch_size, 1)
+
+    support = SUPPORT.to(
+        device=next_probabilities.device,
+        dtype=next_probabilities.dtype,
+    ).unsqueeze(0)
 
     transformed = (
         rewards
-        + gamma_n
-        * (1.0 - terminated)
-        * support
-    )
+        + gamma_n * (1.0 - terminated) * support
+    ).clamp(V_MIN, V_MAX)
 
-    transformed = transformed.clamp(
-        V_MIN,
-        V_MAX,
-    )
+    delta_z = (V_MAX - V_MIN) / (NUM_ATOMS - 1)
+    b = (transformed - V_MIN) / delta_z
 
-    b = (
-        transformed - V_MIN
-    ) / DELTA_Z
+    lower = b.floor().long().clamp(0, NUM_ATOMS - 1)
+    upper = b.ceil().long().clamp(0, NUM_ATOMS - 1)
 
-    lower = b.floor().long()
-    upper = b.ceil().long()
-
-    lower = lower.clamp(0, NUM_ATOMS - 1)
-    upper = upper.clamp(0, NUM_ATOMS - 1)
-
-    lower_weight = upper.float() - b
-    upper_weight = b - lower.float()
+    lower_weight = upper.to(b.dtype) - b
+    upper_weight = b - lower.to(b.dtype)
 
     same = lower == upper
-
     lower_weight = torch.where(
-        same,
-        torch.ones_like(lower_weight),
-        lower_weight,
+        same, torch.ones_like(lower_weight), lower_weight
     )
-
     upper_weight = torch.where(
-        same,
-        torch.zeros_like(upper_weight),
-        upper_weight,
+        same, torch.zeros_like(upper_weight), upper_weight
     )
 
-    projected = torch.zeros_like(
-        next_probabilities
+    # Flattened destination indices need a per-batch-row offset.
+    batch_offsets = (
+        torch.arange(batch_size, device=next_probabilities.device)
+        .unsqueeze(1)
+        * NUM_ATOMS
     )
+    lower_indices = (lower + batch_offsets).reshape(-1)
+    upper_indices = (upper + batch_offsets).reshape(-1)
 
-    projected.view(-1).index_add_(
+    projected = torch.zeros_like(next_probabilities)
+    projected_flat = projected.reshape(-1)
+
+    projected_flat.index_add_(
         0,
-        lower.view(-1),
-        (
-            next_probabilities * lower_weight
-        ).view(-1),
+        lower_indices,
+        (next_probabilities * lower_weight).reshape(-1),
     )
-
-    projected.view(-1).index_add_(
+    projected_flat.index_add_(
         0,
-        upper.view(-1),
-        (
-            next_probabilities * upper_weight
-        ).view(-1),
+        upper_indices,
+        (next_probabilities * upper_weight).reshape(-1),
     )
 
     return projected
+
 
 
 # ============================================================
@@ -1125,6 +1116,12 @@ class RainbowAgent:
         # ----------------------------------------------------
 
         self.online.train()
+
+        # Sample noise once per optimization step. The same online-network
+        # noise is used for the current-state prediction and Double-DQN
+        # next-action selection. Do not reset it again before backward(),
+        # because the current forward graph retains references to these
+        # NoisyLinear noise buffers.
         self.online.reset_noise()
 
         current_logits = self.online(states_t)
@@ -1149,7 +1146,9 @@ class RainbowAgent:
         # ----------------------------------------------------
 
         with torch.no_grad():
-            self.online.reset_noise()
+            # Target-network noise is safe to resample here: target outputs
+            # are computed without gradients. Keep online noise unchanged
+            # until loss.backward() has completed.
             self.target.reset_noise()
 
             online_next_probabilities = self.online.probabilities(
@@ -1544,7 +1543,24 @@ class RocketGUI:
             color,
         )
 
-        self.screen.blit(surface, (x, y))
+        # Pygame requires integer destination coordinates for blit().
+        # World positions (for example OBSTACLE) are stored as NumPy floats,
+        # so normalize every text position here rather than fixing each call.
+        try:
+            x_float = float(x)
+            y_float = float(y)
+        except (TypeError, ValueError, OverflowError):
+            return
+
+        # Avoid passing NaN or infinity to Pygame if a simulation value
+        # becomes temporarily invalid.
+        if not (math.isfinite(x_float) and math.isfinite(y_float)):
+            return
+
+        self.screen.blit(
+            surface,
+            (int(round(x_float)), int(round(y_float))),
+        )
 
     def draw_rocket(self, x, y):
         vector = ACTION_VECTORS[self.current_action]

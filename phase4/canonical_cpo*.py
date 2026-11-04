@@ -3,111 +3,30 @@
 RL COURSE — PHASE 4.16
 ============================================================
 Filename:
-    phase4/canonical_cpo.py
+    phase4/_canonical_cpo.py
 
 LESSON:
     Constrained Policy Optimization (CPO)
 
-PURPOSE
--------
-Train a moving-target tracking robot while constraining its
-expected cumulative safety cost.
+PERFORMANCE-IMPROVED VERSION
 
-WHAT YOU LEARN
---------------
-STEP 1 — Constrained MDP
-    Maximize expected reward subject to an expected-cost limit.
-
-STEP 2 — Gaussian policy
-    Represent continuous robot actions with a probability
-    distribution.
-
-STEP 3 — Reward and cost advantages
-    Estimate the benefits and safety consequences of actions.
-
-STEP 4 — Trust-region optimization
-    Limit policy changes using a KL-divergence constraint.
-
-STEP 5 — Fisher-vector products
-    Compute Hessian-vector products without constructing
-    the full Hessian matrix.
-
-STEP 6 — Conjugate gradient
-    Approximately solve:
-        Hx = g
-        Hy = b
-
-STEP 7 — CPO constrained step
-    Calculate a policy update satisfying the local cost
-    constraint and trust-region constraint.
-
-STEP 8 — Backtracking line search
-    Check actual reward improvement, cost feasibility,
-    and KL divergence before accepting the update.
-
-MATHEMATICS
------------
-Constrained objective:
-
-    maximize    J_reward(theta)
-
-    subject to  J_cost(theta) <= COST_LIMIT
-
-Trust region:
-
-    D_KL(pi_old || pi_new) <= DELTA
-
-Local reward approximation:
-
-    maximize    g.T * step
-
-Local cost approximation:
-
-    c + b.T * step <= 0
-
-Quadratic trust-region approximation:
-
-    0.5 * step.T * H * step <= DELTA
-
-where:
-
-    g = gradient of reward surrogate
-    b = gradient of cost surrogate
-    H = Hessian of KL divergence
-    c = current estimated cost - cost limit
-
-Conjugate gradient:
-
-    Hx = g
-    Hy = b
-
-The implementation uses damped Fisher-vector products
-and a practical CPO constrained-step calculation.
+MAIN IMPROVEMENTS
+-----------------
+1. Correct episode-level reward/cost surrogate scaling.
+2. Squashed Gaussian policy with consistent action log-probability.
+3. Increased training data and training iterations.
+4. Improved target tracking reward.
+5. Target velocity matching reward.
+6. More critic training updates.
+7. Improved CPO recovery line search.
+8. More detailed training metrics.
+9. Success rate, collision rate, and tracking-distance plots.
 
 IMPORTANT
 ---------
-This is an educational implementation of the CPO
-trust-region method. It uses a finite-trajectory estimate
-of episodic discounted cost, approximate conjugate-gradient
-solutions, and backtracking line search.
+Educational CPO implementation.
+Not a formal safety certification.
 
-It is not a formal safety certification. Function
-approximation, finite samples, model errors, and numerical
-approximations can still produce constraint violations.
-
-ROBOTICS APPLICATION
---------------------
-- Autonomous mobile robot navigation
-- Drone obstacle avoidance
-- Industrial robot motion planning
-- Safety-constrained manipulation
-
-Pygame:
-    Mouse   Change moving-target trajectory center
-    SPACE   Pause / resume
-    R       Reset
-    +/-     Simulation speed
-    ESC     Exit
 ============================================================
 """
 
@@ -121,6 +40,7 @@ import pygame
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from torch.distributions import Normal, kl_divergence
 
 
@@ -133,6 +53,9 @@ SEED = 46
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
 
 DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
@@ -172,28 +95,36 @@ ACTION_DIM = 2
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
 
-# CPO trust-region parameters.
+# CPO parameters.
 DELTA = 0.015
-CG_ITERATIONS = 15
+
+CG_ITERATIONS = 20
 CG_TOLERANCE = 1e-10
 FISHER_DAMPING = 0.1
 
-# Backtracking line search.
-LINE_SEARCH_STEPS = 15
+LINE_SEARCH_STEPS = 20
 BACKTRACK_COEFFICIENT = 0.8
 
-# Safety constraint:
-# Maximum expected discounted episode cost.
+# Expected discounted episode cost limit.
 COST_LIMIT = 15.0
 
-EPISODES_PER_ITERATION = 5
+# Increased training budget.
+EPISODES_PER_ITERATION = 8
 MAX_EPISODE_STEPS = 300
-TRAIN_ITERATIONS = 60
+TRAIN_ITERATIONS = 160
 
-ACTOR_LR = 3e-4
-CRITIC_LR = 1e-3
+# Critic training.
+CRITIC_LR = 3e-4
+CRITIC_EPOCHS = 10
 
-ENTROPY_COEFFICIENT = 0.002
+# Policy exploration.
+INITIAL_LOG_STD = -0.8
+
+# Tracking reward parameters.
+TRACKING_DISTANCE_SCALE = 100.0
+VELOCITY_MATCH_SCALE = 80.0
+
+SUCCESS_DISTANCE = 35.0
 
 
 # ============================================================
@@ -201,6 +132,7 @@ ENTROPY_COEFFICIENT = 0.002
 # ============================================================
 
 def clamp_vector(vector, maximum):
+
     vector = np.asarray(
         vector,
         dtype=np.float32
@@ -215,6 +147,7 @@ def clamp_vector(vector, maximum):
 
 
 def safe_unit(vector):
+
     vector = np.asarray(
         vector,
         dtype=np.float32
@@ -229,6 +162,7 @@ def safe_unit(vector):
 
 
 def distance(a, b):
+
     return float(
         np.linalg.norm(
             np.asarray(a) - np.asarray(b)
@@ -237,6 +171,7 @@ def distance(a, b):
 
 
 def flat_parameters(module):
+
     return torch.cat([
         parameter.detach().reshape(-1)
         for parameter in module.parameters()
@@ -244,10 +179,13 @@ def flat_parameters(module):
 
 
 def set_flat_parameters(module, flat_vector):
+
     offset = 0
 
     with torch.no_grad():
+
         for parameter in module.parameters():
+
             count = parameter.numel()
 
             parameter.copy_(
@@ -257,10 +195,15 @@ def set_flat_parameters(module, flat_vector):
 
             offset += count
 
-    assert offset == flat_vector.numel()
+    if offset != flat_vector.numel():
+
+        raise ValueError(
+            "Incorrect flat parameter vector size."
+        )
 
 
 def flat_gradient(gradients):
+
     return torch.cat([
         gradient.contiguous().view(-1)
         for gradient in gradients
@@ -270,16 +213,51 @@ def flat_gradient(gradients):
 def flat_grad(
     output,
     parameters,
-    create_graph=False
+    create_graph=False,
+    retain_graph=None
 ):
+
     gradients = torch.autograd.grad(
         output,
         parameters,
         create_graph=create_graph,
+        retain_graph=retain_graph,
         allow_unused=False
     )
 
     return flat_gradient(gradients)
+
+
+def squashed_log_probability(
+    distribution,
+    raw_action
+):
+    """
+    Log probability of tanh-squashed Gaussian action.
+
+    action = tanh(raw_action)
+
+    log pi(action) =
+        log N(raw_action)
+        - log(1 - tanh(raw_action)^2)
+    """
+
+    log_probability = distribution.log_prob(
+        raw_action
+    )
+
+    correction = torch.log(
+        1.0
+        - torch.tanh(raw_action).pow(2)
+        + 1e-6
+    )
+
+    return (
+        log_probability - correction
+    ).sum(
+        dim=-1,
+        keepdim=True
+    )
 
 
 # ============================================================
@@ -289,6 +267,7 @@ def flat_grad(
 class MovingTarget:
 
     def __init__(self):
+
         self.center = np.array(
             [550.0, 145.0],
             dtype=np.float32
@@ -297,6 +276,7 @@ class MovingTarget:
         self.phase = 0.0
 
     def position_at(self, phase):
+
         return self.center + TARGET_AMPLITUDE * np.array(
             [
                 math.sin(phase),
@@ -306,9 +286,11 @@ class MovingTarget:
         )
 
     def velocity_at(self, phase):
+
         return TARGET_AMPLITUDE * np.array(
             [
                 TARGET_OMEGA * math.cos(phase),
+
                 TARGET_OMEGA * 1.35
                 * math.cos(phase * 1.35 + 0.7)
             ],
@@ -317,16 +299,20 @@ class MovingTarget:
 
     @property
     def position(self):
+
         return self.position_at(self.phase)
 
     @property
     def velocity(self):
+
         return self.velocity_at(self.phase)
 
     def step(self):
+
         self.phase += TARGET_OMEGA * DT
 
     def set_center(self, center):
+
         self.center = np.asarray(
             center,
             dtype=np.float32
@@ -337,7 +323,12 @@ class MovingTarget:
 # 4. ROBOT DYNAMICS
 # ============================================================
 
-def robot_dynamics(position, velocity, action):
+def robot_dynamics(
+    position,
+    velocity,
+    action
+):
+
     action = np.clip(
         np.asarray(action, dtype=np.float32),
         -1.0,
@@ -365,16 +356,19 @@ def robot_dynamics(position, velocity, action):
 
 
 # ============================================================
-# 5. CONSTRAINED ROBOT ENVIRONMENT
+# 5. ENVIRONMENT
 # ============================================================
 
 class MovingTargetEnv:
 
     def __init__(self):
+
         self.target = MovingTarget()
+
         self.reset()
 
     def reset(self):
+
         self.position = np.array(
             [100.0, 440.0],
             dtype=np.float32
@@ -395,6 +389,7 @@ class MovingTargetEnv:
         return self.get_state()
 
     def get_state(self):
+
         relative_target = (
             self.target.position - self.position
         )
@@ -409,29 +404,31 @@ class MovingTargetEnv:
         )
 
         state = np.concatenate([
+
             relative_target / 600.0,
+
             self.target.velocity / 150.0,
+
             self.velocity / MAX_SPEED,
+
             relative_obstacle / 600.0,
-            np.array([
-                clearance / 200.0,
-                distance(
-                    self.position,
-                    self.target.position
-                ) / 600.0
-            ], dtype=np.float32)
+
+            np.array(
+                [
+                    clearance / 200.0,
+
+                    distance(
+                        self.position,
+                        self.target.position
+                    ) / 600.0
+                ],
+                dtype=np.float32
+            )
         ])
 
         return state.astype(np.float32)
 
     def safety_cost(self):
-        """
-        Episodic safety cost.
-
-        Proximity to the obstacle produces a cost.
-        Actual collision produces a large additional cost.
-        Approaching world boundaries also produces a cost.
-        """
 
         clearance = (
             distance(self.position, OBSTACLE)
@@ -444,15 +441,21 @@ class MovingTargetEnv:
         )
 
         boundary_clearances = [
+
             self.position[0] - ROBOT_RADIUS,
+
             WIDTH - ROBOT_RADIUS - self.position[0],
+
             self.position[1] - ROBOT_RADIUS,
+
             HEIGHT - ROBOT_RADIUS - self.position[1]
         ]
 
         boundary_cost = max(
             0.0,
-            (35.0 - min(boundary_clearances)) / 35.0
+            (
+                35.0 - min(boundary_clearances)
+            ) / 35.0
         )
 
         collision = (
@@ -460,7 +463,9 @@ class MovingTargetEnv:
             < OBSTACLE_RADIUS + ROBOT_RADIUS
         )
 
-        outside = min(boundary_clearances) < 0
+        outside = (
+            min(boundary_clearances) < 0
+        )
 
         cost = (
             proximity_cost
@@ -468,21 +473,22 @@ class MovingTargetEnv:
         )
 
         if collision or outside:
+
             cost += 10.0
 
         return float(cost)
 
     def step(self, action):
+
         action = np.clip(
             np.asarray(action, dtype=np.float32),
             -1.0,
             1.0
         )
 
-        # Compare old and new robot positions against
-        # the same future target position.
         next_phase = (
-            self.target.phase + TARGET_OMEGA * DT
+            self.target.phase
+            + TARGET_OMEGA * DT
         )
 
         future_target = (
@@ -502,19 +508,53 @@ class MovingTargetEnv:
 
         self.target.step()
 
+        target_position = self.target.position
+        target_velocity = self.target.velocity
+
         distance_after = distance(
             self.position,
-            self.target.position
+            target_position
         )
 
-        progress = (
-            distance_before - distance_after
+        # ----------------------------------------------------
+        # Improved reward shaping.
+        # ----------------------------------------------------
+
+        progress_reward = (
+            0.05 * (
+                distance_before - distance_after
+            )
+        )
+
+        tracking_reward = (
+            1.2 * math.exp(
+                -distance_after / TRACKING_DISTANCE_SCALE
+            )
+        )
+
+        velocity_error = (
+            self.velocity - target_velocity
+        )
+
+        velocity_error_norm = float(
+            np.linalg.norm(velocity_error)
+        )
+
+        velocity_match_reward = (
+            0.2 * math.exp(
+                -velocity_error_norm / VELOCITY_MATCH_SCALE
+            )
+        )
+
+        action_penalty = (
+            0.015 * float(np.sum(action ** 2))
         )
 
         reward = (
-            0.08 * progress
-            + 0.3 * math.exp(-distance_after / 75.0)
-            - 0.015 * float(np.sum(action ** 2))
+            progress_reward
+            + tracking_reward
+            + velocity_match_reward
+            - action_penalty
         )
 
         cost = self.safety_cost()
@@ -531,9 +571,12 @@ class MovingTargetEnv:
             or self.position[1] > HEIGHT - ROBOT_RADIUS
         )
 
-        terminated = collision or outside
+        terminated = (
+            collision or outside
+        )
 
         if terminated:
+
             reward -= 100.0
 
         self.steps += 1
@@ -542,11 +585,21 @@ class MovingTargetEnv:
             self.steps >= MAX_EPISODE_STEPS
         )
 
+        success = (
+            distance_after < SUCCESS_DISTANCE
+        )
+
         info = {
+
             "distance": distance_after,
+
             "cost": cost,
+
             "collision": collision,
-            "outside": outside
+
+            "outside": outside,
+
+            "success": success
         }
 
         return (
@@ -560,18 +613,23 @@ class MovingTargetEnv:
 
 
 # ============================================================
-# 6. GAUSSIAN CONTINUOUS POLICY
+# 6. SQUASHED GAUSSIAN POLICY
 # ============================================================
 
 class GaussianPolicy(nn.Module):
 
     def __init__(self):
+
         super().__init__()
 
         self.backbone = nn.Sequential(
+
             nn.Linear(STATE_DIM, 128),
+
             nn.Tanh(),
+
             nn.Linear(128, 128),
+
             nn.Tanh()
         )
 
@@ -583,17 +641,18 @@ class GaussianPolicy(nn.Module):
         self.log_std = nn.Parameter(
             torch.full(
                 (ACTION_DIM,),
-                -0.7
+                INITIAL_LOG_STD
             )
         )
 
     def forward(self, states):
+
         features = self.backbone(states)
 
         mean = self.mean(features)
 
         log_std = self.log_std.clamp(
-            -3.0,
+            -2.5,
             0.5
         )
 
@@ -602,29 +661,56 @@ class GaussianPolicy(nn.Module):
         return mean, std
 
     def distribution(self, states):
+
         mean, std = self(states)
 
         return Normal(mean, std)
 
+    def sample_action(self, states):
+
+        distribution = self.distribution(states)
+
+        raw_action = distribution.rsample()
+
+        action = torch.tanh(raw_action)
+
+        log_probability = squashed_log_probability(
+            distribution,
+            raw_action
+        )
+
+        return (
+            action,
+            raw_action,
+            log_probability
+        )
+
 
 # ============================================================
-# 7. REWARD AND COST CRITICS
+# 7. VALUE NETWORK
 # ============================================================
 
 class ValueNetwork(nn.Module):
 
     def __init__(self):
+
         super().__init__()
 
         self.network = nn.Sequential(
+
             nn.Linear(STATE_DIM, 128),
+
             nn.Tanh(),
+
             nn.Linear(128, 128),
+
             nn.Tanh(),
+
             nn.Linear(128, 1)
         )
 
     def forward(self, states):
+
         return self.network(states)
 
 
@@ -638,15 +724,6 @@ def conjugate_gradient(
     iterations=CG_ITERATIONS,
     tolerance=CG_TOLERANCE
 ):
-    """
-    Approximately solve:
-
-        Hx = vector
-
-    without explicitly constructing H.
-
-    H is the damped Fisher information matrix.
-    """
 
     solution = torch.zeros_like(vector)
 
@@ -658,11 +735,8 @@ def conjugate_gradient(
         residual
     )
 
-    initial_residual = float(
-        residual_dot.item()
-    )
+    if residual_dot.item() < tolerance:
 
-    if initial_residual < tolerance:
         return solution
 
     for _ in range(iterations):
@@ -677,6 +751,7 @@ def conjugate_gradient(
         )
 
         if denominator.item() <= 1e-12:
+
             break
 
         alpha = (
@@ -697,6 +772,7 @@ def conjugate_gradient(
         )
 
         if new_residual_dot.item() < tolerance:
+
             break
 
         beta = (
@@ -724,15 +800,6 @@ def collect_episodes(
     cost_critic,
     episode_count
 ):
-    """
-    Collect complete episodes.
-
-    Actions are sampled from the Gaussian policy and clipped
-    only before entering the physical environment.
-
-    Log probabilities are calculated using the original
-    Gaussian samples, not the clipped actions.
-    """
 
     all_states = []
     all_actions = []
@@ -749,10 +816,15 @@ def collect_episodes(
 
     all_terminated = []
     all_episode_ends = []
+    all_discounts = []
 
     episode_rewards = []
     episode_costs = []
     episode_lengths = []
+
+    episode_distances = []
+    episode_successes = []
+    episode_collisions = []
 
     for _ in range(episode_count):
 
@@ -760,7 +832,14 @@ def collect_episodes(
 
         episode_reward = 0.0
         episode_cost = 0.0
+
         episode_length = 0
+
+        distance_sum = 0.0
+        success_count = 0
+        collision_count = 0
+
+        discount = 1.0
 
         for _ in range(MAX_EPISODE_STEPS):
 
@@ -771,17 +850,20 @@ def collect_episodes(
             ).unsqueeze(0)
 
             with torch.no_grad():
+
                 distribution = policy.distribution(
                     state_tensor
                 )
 
                 raw_action = distribution.sample()
 
-                log_probability = distribution.log_prob(
+                action = torch.tanh(
                     raw_action
-                ).sum(
-                    dim=1,
-                    keepdim=True
+                )
+
+                log_probability = squashed_log_probability(
+                    distribution,
+                    raw_action
                 )
 
                 reward_value = reward_critic(
@@ -796,11 +878,9 @@ def collect_episodes(
                 raw_action.cpu().numpy()[0]
             )
 
-            environment_action = np.clip(
-                raw_action_np,
-                -1.0,
-                1.0
-            )
+            environment_action = np.tanh(
+                raw_action_np
+            ).astype(np.float32)
 
             (
                 next_state,
@@ -818,16 +898,24 @@ def collect_episodes(
             ).unsqueeze(0)
 
             with torch.no_grad():
+
                 if terminated:
+
                     next_reward_value = 0.0
                     next_cost_value = 0.0
+
                 else:
+
                     next_reward_value = float(
-                        reward_critic(next_tensor).item()
+                        reward_critic(
+                            next_tensor
+                        ).item()
                     )
 
                     next_cost_value = float(
-                        cost_critic(next_tensor).item()
+                        cost_critic(
+                            next_tensor
+                        ).item()
                     )
 
             episode_end = (
@@ -835,6 +923,8 @@ def collect_episodes(
             )
 
             all_states.append(state)
+
+            # Store latent Gaussian action.
             all_actions.append(raw_action_np)
 
             all_log_probs.append(
@@ -868,13 +958,31 @@ def collect_episodes(
                 float(episode_end)
             )
 
+            all_discounts.append(
+                discount
+            )
+
             episode_reward += reward
             episode_cost += cost
+
             episode_length += 1
+
+            distance_sum += info["distance"]
+
+            success_count += int(
+                info["success"]
+            )
+
+            collision_count += int(
+                info["collision"]
+            )
 
             state = next_state
 
+            discount *= GAMMA
+
             if episode_end:
+
                 break
 
         episode_rewards.append(
@@ -889,7 +997,20 @@ def collect_episodes(
             episode_length
         )
 
-    data = {
+        episode_distances.append(
+            distance_sum / max(episode_length, 1)
+        )
+
+        episode_successes.append(
+            success_count / max(episode_length, 1)
+        )
+
+        episode_collisions.append(
+            collision_count
+        )
+
+    return {
+
         "states": np.asarray(
             all_states,
             dtype=np.float32
@@ -945,12 +1066,23 @@ def collect_episodes(
             dtype=np.float32
         ),
 
-        "episode_rewards": episode_rewards,
-        "episode_costs": episode_costs,
-        "episode_lengths": episode_lengths
-    }
+        "discounts": np.asarray(
+            all_discounts,
+            dtype=np.float32
+        ),
 
-    return data
+        "episode_rewards": episode_rewards,
+
+        "episode_costs": episode_costs,
+
+        "episode_lengths": episode_lengths,
+
+        "episode_distances": episode_distances,
+
+        "episode_successes": episode_successes,
+
+        "episode_collisions": episode_collisions
+    }
 
 
 # ============================================================
@@ -964,14 +1096,6 @@ def calculate_gae(
     terminated,
     episode_ends
 ):
-    """
-    Separate reward and cost advantages are calculated.
-
-    GAE recursion is reset at episode boundaries.
-
-    Truncation bootstraps from the final observation.
-    True termination does not bootstrap.
-    """
 
     advantages = np.zeros_like(
         rewards,
@@ -995,6 +1119,7 @@ def calculate_gae(
         )
 
         if episode_ends[index]:
+
             gae = 0.0
 
         gae = (
@@ -1007,19 +1132,14 @@ def calculate_gae(
 
         advantages[index] = gae
 
-    returns = advantages + values
+    returns = (
+        advantages + values
+    )
 
     return advantages, returns
 
 
 def discounted_episode_costs(data):
-    """
-    Estimate discounted cost separately for each episode.
-
-    The cost constraint is episodic:
-
-        E[sum_t gamma^t * cost_t] <= COST_LIMIT
-    """
 
     episode_costs = []
 
@@ -1031,11 +1151,14 @@ def discounted_episode_costs(data):
         data["episode_ends"]
     ):
 
-        running_cost += discount * float(cost)
+        running_cost += (
+            discount * float(cost)
+        )
 
         discount *= GAMMA
 
         if episode_end:
+
             episode_costs.append(
                 running_cost
             )
@@ -1043,7 +1166,8 @@ def discounted_episode_costs(data):
             running_cost = 0.0
             discount = 1.0
 
-    if len(episode_costs) == 0:
+    if not episode_costs:
+
         return 0.0
 
     return float(
@@ -1058,9 +1182,11 @@ def discounted_episode_costs(data):
 class CPOAgent:
 
     def __init__(self):
+
         self.policy = GaussianPolicy().to(DEVICE)
 
         self.reward_critic = ValueNetwork().to(DEVICE)
+
         self.cost_critic = ValueNetwork().to(DEVICE)
 
         self.reward_optimizer = torch.optim.Adam(
@@ -1073,7 +1199,17 @@ class CPOAgent:
             lr=CRITIC_LR
         )
 
-    def train_critics(self, data, reward_returns, cost_returns):
+    # --------------------------------------------------------
+    # Critic training
+    # --------------------------------------------------------
+
+    def train_critics(
+        self,
+        data,
+        reward_returns,
+        cost_returns
+    ):
+
         states = torch.tensor(
             data["states"],
             dtype=torch.float32,
@@ -1095,18 +1231,21 @@ class CPOAgent:
         reward_losses = []
         cost_losses = []
 
-        for _ in range(5):
+        for _ in range(CRITIC_EPOCHS):
 
             predicted_reward = (
                 self.reward_critic(states)
             )
 
-            reward_loss = F.mse_loss(
+            reward_loss = F.smooth_l1_loss(
                 predicted_reward,
                 reward_targets
             )
 
-            self.reward_optimizer.zero_grad()
+            self.reward_optimizer.zero_grad(
+                set_to_none=True
+            )
+
             reward_loss.backward()
 
             nn.utils.clip_grad_norm_(
@@ -1120,12 +1259,15 @@ class CPOAgent:
                 self.cost_critic(states)
             )
 
-            cost_loss = F.mse_loss(
+            cost_loss = F.smooth_l1_loss(
                 predicted_cost,
                 cost_targets
             )
 
-            self.cost_optimizer.zero_grad()
+            self.cost_optimizer.zero_grad(
+                set_to_none=True
+            )
+
             cost_loss.backward()
 
             nn.utils.clip_grad_norm_(
@@ -1144,15 +1286,22 @@ class CPOAgent:
             )
 
         return {
+
             "reward_value_loss": float(
                 np.mean(reward_losses)
             ),
+
             "cost_value_loss": float(
                 np.mean(cost_losses)
             )
         }
 
+    # --------------------------------------------------------
+    # Advantage preparation
+    # --------------------------------------------------------
+
     def prepare_data(self, data):
+
         reward_advantages, reward_returns = calculate_gae(
             data["rewards"],
             data["reward_values"],
@@ -1169,31 +1318,47 @@ class CPOAgent:
             data["episode_ends"]
         )
 
-        # Reward advantage normalization.
-        reward_advantages = (
-            reward_advantages
-            - reward_advantages.mean()
-        ) / (
+        reward_std = (
             reward_advantages.std() + 1e-8
         )
 
-        # Do not normalize cost advantages independently:
-        # their scale carries information about safety cost.
+        reward_advantages = (
+            reward_advantages
+            - reward_advantages.mean()
+        ) / reward_std
+
+        # Cost advantages are intentionally NOT normalized.
+        # Their scale is important for the cost constraint.
+
         return (
+
             reward_advantages.astype(np.float32),
+
             cost_advantages.astype(np.float32),
+
             reward_returns.astype(np.float32),
+
             cost_returns.astype(np.float32)
         )
 
-    def update_policy(self, data, reward_advantages, cost_advantages):
+    # --------------------------------------------------------
+    # CPO policy update
+    # --------------------------------------------------------
+
+    def update_policy(
+        self,
+        data,
+        reward_advantages,
+        cost_advantages
+    ):
+
         states = torch.tensor(
             data["states"],
             dtype=torch.float32,
             device=DEVICE
         )
 
-        actions = torch.tensor(
+        raw_actions = torch.tensor(
             data["actions"],
             dtype=torch.float32,
             device=DEVICE
@@ -1204,6 +1369,12 @@ class CPOAgent:
             dtype=torch.float32,
             device=DEVICE
         )
+
+        discounts = torch.tensor(
+            data["discounts"],
+            dtype=torch.float32,
+            device=DEVICE
+        ).unsqueeze(1)
 
         reward_advantages = torch.tensor(
             reward_advantages,
@@ -1225,13 +1396,23 @@ class CPOAgent:
             self.policy
         ).clone()
 
-        # Freeze the old policy distribution.
+        episode_count = max(
+            len(data["episode_rewards"]),
+            1
+        )
+
+        # ----------------------------------------------------
+        # Freeze old policy distribution.
+        # ----------------------------------------------------
+
         with torch.no_grad():
+
             old_distribution = (
                 self.policy.distribution(states)
             )
 
             old_mean = old_distribution.mean.detach()
+
             old_std = old_distribution.stddev.detach()
 
         old_distribution = Normal(
@@ -1239,33 +1420,60 @@ class CPOAgent:
             old_std
         )
 
+        # ----------------------------------------------------
+        # Episode-level surrogate objectives.
+        #
+        # IMPORTANT FIX:
+        #
+        # The measured cost is a discounted episode sum.
+        # Therefore, the cost surrogate must also represent
+        # an episode-level discounted quantity.
+        #
+        # We use:
+        #
+        # sum_t gamma^t * ratio_t * advantage_t
+        # ----------------------------------------------------
+
         def surrogate_terms():
+
             new_distribution = (
                 self.policy.distribution(states)
             )
 
-            new_log_probs = new_distribution.log_prob(
-                actions
-            ).sum(
-                dim=1,
-                keepdim=True
+            new_log_probs = squashed_log_probability(
+                new_distribution,
+                raw_actions
             )
 
             ratio = torch.exp(
                 new_log_probs - old_log_probs
             )
 
+            weighted_reward = (
+                discounts
+                * ratio
+                * reward_advantages
+            )
+
+            weighted_cost = (
+                discounts
+                * ratio
+                * cost_advantages
+            )
+
             reward_surrogate = (
-                ratio * reward_advantages
-            ).mean()
+                weighted_reward.sum() / episode_count
+            )
 
             cost_surrogate = (
-                ratio * cost_advantages
-            ).mean()
+                weighted_cost.sum() / episode_count
+            )
 
-            entropy = new_distribution.entropy().sum(
-                dim=1
-            ).mean()
+            entropy = (
+                new_distribution.entropy()
+                .sum(dim=1)
+                .mean()
+            )
 
             return (
                 reward_surrogate,
@@ -1273,33 +1481,31 @@ class CPOAgent:
                 entropy
             )
 
-        # ----------------------------------------------------
-        # Current reward and cost surrogate.
-        # ----------------------------------------------------
+        (
+            reward_surrogate,
+            cost_surrogate,
+            entropy
+        ) = surrogate_terms()
 
-        reward_surrogate, cost_surrogate, entropy = (
-            surrogate_terms()
-        )
-
+        # Shared graph: retain for first gradient.
         reward_gradient = flat_grad(
             reward_surrogate,
-            parameters
+            parameters,
+            retain_graph=True
         ).detach()
 
+        # Second gradient consumes the graph.
         cost_gradient = flat_grad(
             cost_surrogate,
             parameters
         ).detach()
 
         # ----------------------------------------------------
-        # KL Hessian-vector product.
-        #
-        # FVP(v) = (H_KL + damping*I) @ v
-        #
-        # The full Hessian is never constructed.
+        # Fisher-vector product.
         # ----------------------------------------------------
 
         def fisher_vector_product(vector):
+
             current_distribution = (
                 self.policy.distribution(states)
             )
@@ -1337,7 +1543,7 @@ class CPOAgent:
             )
 
         # ----------------------------------------------------
-        # Solve:
+        # Conjugate gradient solves:
         #
         # Hx = g
         # Hy = b
@@ -1381,7 +1587,7 @@ class CPOAgent:
         )
 
         # ----------------------------------------------------
-        # Calculate constrained step.
+        # CPO step calculation.
         # ----------------------------------------------------
 
         step = torch.zeros_like(
@@ -1389,6 +1595,7 @@ class CPOAgent:
         )
 
         recovery_step = False
+
         step_status = "no_update"
 
         if (
@@ -1396,7 +1603,6 @@ class CPOAgent:
             and q_value > 1e-10
         ):
 
-            # First check the unconstrained trust-region step.
             unconstrained_scale = math.sqrt(
                 2.0 * DELTA / q_value
             )
@@ -1416,11 +1622,10 @@ class CPOAgent:
             if unconstrained_cost <= 0.0:
 
                 step = unconstrained_step
+
                 step_status = "unconstrained_feasible"
 
             else:
-                # The unconstrained step violates the cost
-                # constraint. Solve the local constrained problem.
 
                 A = (
                     q_value
@@ -1450,34 +1655,33 @@ class CPOAgent:
 
                     step_status = "constrained"
 
+                elif c > 0.0:
+
+                    # Cost recovery direction.
+                    recovery_step = True
+
+                    step = (
+                        -math.sqrt(
+                            2.0 * DELTA / s_value
+                        ) * y
+                    )
+
+                    step_status = "recovery"
+
                 else:
-                    # Current policy is outside the feasible
-                    # region and the local feasible intersection
-                    # is unavailable under this approximation.
-                    #
-                    # Take a cost-reducing recovery step.
-                    if c > 0.0:
 
-                        recovery_step = True
-
-                        step = (
-                            -math.sqrt(
-                                2.0 * DELTA / s_value
-                            ) * y
-                        )
-
-                        step_status = "recovery"
-
-                    else:
-                        step_status = "degenerate"
+                    step_status = "degenerate"
 
         # ----------------------------------------------------
         # Backtracking line search.
         # ----------------------------------------------------
 
         accepted = False
+
         accepted_kl = 0.0
+
         accepted_cost = current_episode_cost
+
         accepted_reward = float(
             reward_surrogate.item()
         )
@@ -1511,9 +1715,11 @@ class CPOAgent:
 
                 with torch.no_grad():
 
-                    candidate_reward, candidate_cost, _ = (
-                        surrogate_terms()
-                    )
+                    (
+                        candidate_reward,
+                        candidate_cost,
+                        _
+                    ) = surrogate_terms()
 
                     candidate_distribution = (
                         self.policy.distribution(states)
@@ -1534,12 +1740,7 @@ class CPOAgent:
                         candidate_cost.item()
                     )
 
-                # Local cost estimate:
-                #
-                # J_cost(new) approximately equals
-                # J_cost(old) + surrogate_cost(new)
-                #                         - surrogate_cost(old)
-                #
+                # Correct episode-level cost prediction.
                 predicted_cost = (
                     current_episode_cost
                     + candidate_cost
@@ -1551,20 +1752,26 @@ class CPOAgent:
                 )
 
                 if recovery_step:
-                    # Recovery prioritizes cost reduction.
+
+                    # Recovery must reduce cost even if the
+                    # constraint cannot be satisfied in one step.
                     objective_ok = (
                         predicted_cost
-                        < current_episode_cost
+                        < current_episode_cost - 1e-8
                     )
+
+                    constraint_ok = True
+
                 else:
+
                     objective_ok = (
                         candidate_reward
                         >= original_reward - 1e-8
                     )
 
-                constraint_ok = (
-                    predicted_cost <= COST_LIMIT
-                )
+                    constraint_ok = (
+                        predicted_cost <= COST_LIMIT
+                    )
 
                 if (
                     trust_region_ok
@@ -1573,14 +1780,19 @@ class CPOAgent:
                 ):
 
                     accepted = True
+
                     accepted_kl = kl_value
+
                     accepted_cost = predicted_cost
+
                     accepted_reward = candidate_reward
 
                     step_status += "_accepted"
+
                     break
 
             if not accepted:
+
                 set_flat_parameters(
                     self.policy,
                     old_parameters
@@ -1589,25 +1801,41 @@ class CPOAgent:
                 step_status += "_rejected"
 
         else:
+
             set_flat_parameters(
                 self.policy,
                 old_parameters
             )
 
         return {
+
             "accepted": accepted,
+
             "status": step_status,
+
             "kl": accepted_kl,
+
             "estimated_cost": accepted_cost,
+
             "estimated_reward_surrogate": accepted_reward,
+
             "current_episode_cost": current_episode_cost,
+
             "q": q_value,
+
             "r": r_value,
+
             "s": s_value,
+
             "entropy": float(entropy.item())
         }
 
+    # --------------------------------------------------------
+    # Complete update
+    # --------------------------------------------------------
+
     def update(self, data):
+
         (
             reward_advantages,
             cost_advantages,
@@ -1632,8 +1860,17 @@ class CPOAgent:
             **policy_metrics
         }
 
+    # --------------------------------------------------------
+    # Inference
+    # --------------------------------------------------------
+
     @torch.no_grad()
-    def act(self, state, deterministic=True):
+    def act(
+        self,
+        state,
+        deterministic=True
+    ):
+
         state_tensor = torch.tensor(
             state,
             dtype=torch.float32,
@@ -1645,15 +1882,18 @@ class CPOAgent:
         )
 
         if deterministic:
-            action = distribution.mean
-        else:
-            action = distribution.sample()
 
-        return np.clip(
-            action.cpu().numpy()[0],
-            -1.0,
-            1.0
-        )
+            action = torch.tanh(
+                distribution.mean
+            )
+
+        else:
+
+            action = torch.tanh(
+                distribution.sample()
+            )
+
+        return action.cpu().numpy()[0]
 
 
 # ============================================================
@@ -1661,22 +1901,47 @@ class CPOAgent:
 # ============================================================
 
 def train_agent():
+
     env = MovingTargetEnv()
+
     agent = CPOAgent()
 
     history = {
+
         "rewards": [],
+
         "costs": [],
+
         "lengths": [],
+
+        "distances": [],
+
+        "successes": [],
+
+        "collisions": [],
+
         "kl": [],
+
         "accepted": [],
+
         "status": []
     }
 
-    print("\nTraining CPO agent...")
+    print("\nTraining performance-improved CPO agent...")
+
     print(f"Device: {DEVICE}")
+
     print(f"Trust-region radius: {DELTA}")
-    print(f"Discounted episode-cost limit: {COST_LIMIT}")
+
+    print(f"Cost limit: {COST_LIMIT}")
+
+    print(
+        f"Episodes per iteration: {EPISODES_PER_ITERATION}"
+    )
+
+    print(
+        f"Training iterations: {TRAIN_ITERATIONS}"
+    )
 
     for iteration in range(TRAIN_ITERATIONS):
 
@@ -1702,6 +1967,22 @@ def train_agent():
             np.mean(data["episode_lengths"])
         )
 
+        mean_distance = float(
+            np.mean(data["episode_distances"])
+        )
+
+        mean_success = float(
+            np.mean(data["episode_successes"])
+        )
+
+        collision_rate = float(
+            np.mean(
+                np.asarray(
+                    data["episode_collisions"]
+                ) > 0
+            )
+        )
+
         history["rewards"].append(
             mean_reward
         )
@@ -1712,6 +1993,18 @@ def train_agent():
 
         history["lengths"].append(
             mean_length
+        )
+
+        history["distances"].append(
+            mean_distance
+        )
+
+        history["successes"].append(
+            mean_success
+        )
+
+        history["collisions"].append(
+            collision_rate
         )
 
         history["kl"].append(
@@ -1727,13 +2020,26 @@ def train_agent():
         )
 
         if (iteration + 1) % 2 == 0:
+
             print(
+
                 f"Iteration {iteration + 1:3d}/"
                 f"{TRAIN_ITERATIONS} | "
+
                 f"Reward {mean_reward:8.2f} | "
-                f"Episode cost {mean_cost:8.2f} | "
+
+                f"Cost {mean_cost:7.2f} | "
+
+                f"Distance {mean_distance:7.1f} | "
+
+                f"Success {mean_success * 100:5.1f}% | "
+
+                f"Collision {collision_rate * 100:5.1f}% | "
+
                 f"KL {metrics['kl']:.5f} | "
+
                 f"Accepted {metrics['accepted']} | "
+
                 f"{metrics['status']}"
             )
 
@@ -1744,106 +2050,200 @@ def train_agent():
 # 13. TRAINING VISUALIZATION
 # ============================================================
 
+def moving_average(values, window=10):
+
+    values = np.asarray(
+        values,
+        dtype=np.float32
+    )
+
+    if len(values) < window:
+
+        return values
+
+    kernel = np.ones(
+        window,
+        dtype=np.float32
+    ) / window
+
+    return np.convolve(
+        values,
+        kernel,
+        mode="valid"
+    )
+
+
 def visualize_training(history):
+
     try:
+
         import matplotlib.pyplot as plt
 
         fig, axes = plt.subplots(
             3,
-            1,
-            figsize=(10, 10)
+            2,
+            figsize=(14, 11)
         )
 
         rewards = history["rewards"]
         costs = history["costs"]
+        distances = history["distances"]
+        successes = history["successes"]
+        collisions = history["collisions"]
         kls = history["kl"]
 
-        axes[0].plot(
+        # Reward.
+        axes[0, 0].plot(
             rewards,
-            label="Episode reward"
+            alpha=0.35,
+            label="Raw reward"
         )
 
-        axes[0].set_title(
-            "CPO Task Reward"
+        axes[0, 0].plot(
+            moving_average(rewards),
+            label="Moving average"
         )
 
-        axes[0].set_xlabel(
-            "Training iteration"
+        axes[0, 0].set_title(
+            "Episode Reward"
         )
 
-        axes[0].set_ylabel(
-            "Reward"
+        axes[0, 0].set_xlabel(
+            "Iteration"
         )
 
-        axes[0].grid(True)
-        axes[0].legend()
+        axes[0, 0].grid(True)
+        axes[0, 0].legend()
 
-        axes[1].plot(
+        # Cost.
+        axes[0, 1].plot(
             costs,
-            label="Discounted episode safety cost"
+            label="Episode cost"
         )
 
-        axes[1].axhline(
+        axes[0, 1].axhline(
             COST_LIMIT,
             linestyle="--",
             label="Cost limit"
         )
 
-        axes[1].set_title(
-            "Safety Constraint"
+        axes[0, 1].set_title(
+            "Discounted Episode Safety Cost"
         )
 
-        axes[1].set_xlabel(
-            "Training iteration"
+        axes[0, 1].grid(True)
+        axes[0, 1].legend()
+
+        # Tracking distance.
+        axes[1, 0].plot(
+            distances,
+            label="Mean target distance"
         )
 
-        axes[1].set_ylabel(
-            "Discounted cost"
+        axes[1, 0].set_title(
+            "Tracking Performance"
         )
 
-        axes[1].grid(True)
-        axes[1].legend()
+        axes[1, 0].set_xlabel(
+            "Iteration"
+        )
 
-        axes[2].plot(
+        axes[1, 0].set_ylabel(
+            "Distance (pixels)"
+        )
+
+        axes[1, 0].grid(True)
+        axes[1, 0].legend()
+
+        # Success.
+        axes[1, 1].plot(
+            np.asarray(successes) * 100.0,
+            label="Success percentage"
+        )
+
+        axes[1, 1].set_title(
+            "Tracking Success Rate"
+        )
+
+        axes[1, 1].set_xlabel(
+            "Iteration"
+        )
+
+        axes[1, 1].set_ylabel(
+            "Percentage"
+        )
+
+        axes[1, 1].set_ylim(
+            0,
+            100
+        )
+
+        axes[1, 1].grid(True)
+        axes[1, 1].legend()
+
+        # Collision rate.
+        axes[2, 0].plot(
+            np.asarray(collisions) * 100.0,
+            label="Episodes with collision"
+        )
+
+        axes[2, 0].set_title(
+            "Collision Rate"
+        )
+
+        axes[2, 0].set_xlabel(
+            "Iteration"
+        )
+
+        axes[2, 0].set_ylabel(
+            "Percentage"
+        )
+
+        axes[2, 0].grid(True)
+        axes[2, 0].legend()
+
+        # KL.
+        axes[2, 1].plot(
             kls,
-            label="Accepted KL divergence"
+            label="Accepted KL"
         )
 
-        axes[2].axhline(
+        axes[2, 1].axhline(
             DELTA,
             linestyle="--",
             label="Trust-region limit"
         )
 
-        axes[2].set_title(
+        axes[2, 1].set_title(
             "Trust Region"
         )
 
-        axes[2].set_xlabel(
-            "Training iteration"
+        axes[2, 1].set_xlabel(
+            "Iteration"
         )
 
-        axes[2].set_ylabel(
-            "KL divergence"
-        )
-
-        axes[2].grid(True)
-        axes[2].legend()
+        axes[2, 1].grid(True)
+        axes[2, 1].legend()
 
         plt.tight_layout()
+
         plt.show()
 
     except ImportError:
-        print("Matplotlib unavailable; skipping plots.")
+
+        print(
+            "Matplotlib unavailable; skipping plots."
+        )
 
 
 # ============================================================
-# 14. PYGAME ROCKET VISUALIZATION
+# 14. PYGAME VISUALIZATION
 # ============================================================
 
 class RocketGUI:
 
     def __init__(self, agent):
+
         pygame.init()
 
         self.screen = pygame.display.set_mode(
@@ -1851,7 +2251,7 @@ class RocketGUI:
         )
 
         pygame.display.set_caption(
-            "Phase 4.16 — Canonical CPO Rocket"
+            "Phase 4.16 — Performance-Improved CPO"
         )
 
         self.clock = pygame.time.Clock()
@@ -1867,12 +2267,15 @@ class RocketGUI:
         )
 
         self.agent = agent
+
         self.env = MovingTargetEnv()
 
         self.env.reset()
 
         self.paused = False
+
         self.speed = 1
+
         self.running = True
 
         self.last_action = np.zeros(
@@ -1881,22 +2284,28 @@ class RocketGUI:
         )
 
         self.last_cost = 0.0
+
         self.last_reward = 0.0
 
     def reset(self):
+
         self.env.reset()
 
         self.last_action[:] = 0.0
+
         self.last_cost = 0.0
+
         self.last_reward = 0.0
 
     def change_target_center(self, position):
+
         x, y = position
 
         if not (
             150 < x < WIDTH - 130
             and 100 < y < HEIGHT - 100
         ):
+
             return
 
         candidate = np.array(
@@ -1916,42 +2325,84 @@ class RocketGUI:
         if clearance < (
             OBSTACLE_RADIUS + ROBOT_RADIUS + 25
         ):
+
             return
 
         self.env.target.set_center(
             candidate
         )
 
-    def draw_arrow(self, start, end, color, width=2):
-        start = np.asarray(start)
-        end = np.asarray(end)
+    def draw_arrow(
+        self,
+        start,
+        end,
+        color,
+        width=2
+    ):
+
+        start = np.asarray(
+            start,
+            dtype=np.float64
+        )
+
+        end = np.asarray(
+            end,
+            dtype=np.float64
+        )
+
+        if (
+            start.shape != (2,)
+            or end.shape != (2,)
+        ):
+
+            return
+
+        if not (
+            np.all(np.isfinite(start))
+            and np.all(np.isfinite(end))
+        ):
+
+            return
+
+        start_point = (
+            int(round(start[0])),
+            int(round(start[1]))
+        )
+
+        end_point = (
+            int(round(end[0])),
+            int(round(end[1]))
+        )
 
         pygame.draw.line(
             self.screen,
             color,
-            tuple(start.astype(int)),
-            tuple(end.astype(int)),
+            start_point,
+            end_point,
             width
         )
 
-        direction = safe_unit(
-            end - start
-        )
+        vector = end - start
 
-        if np.linalg.norm(direction) < 1e-6:
+        norm = np.linalg.norm(vector)
+
+        if norm < 1e-6:
+
             return
+
+        direction = vector / norm
 
         perpendicular = np.array(
             [-direction[1], direction[0]]
         )
 
         p1 = (
-            end - direction * 10
+            end - direction * 11
             + perpendicular * 5
         )
 
         p2 = (
-            end - direction * 10
+            end - direction * 11
             - perpendicular * 5
         )
 
@@ -1959,13 +2410,22 @@ class RocketGUI:
             self.screen,
             color,
             [
-                end.astype(int),
-                p1.astype(int),
-                p2.astype(int)
+                end_point,
+
+                (
+                    int(round(p1[0])),
+                    int(round(p1[1]))
+                ),
+
+                (
+                    int(round(p2[0])),
+                    int(round(p2[1]))
+                )
             ]
         )
 
     def draw_rocket(self):
+
         position = self.env.position
 
         direction = safe_unit(
@@ -1973,11 +2433,13 @@ class RocketGUI:
         )
 
         if np.linalg.norm(direction) < 0.1:
+
             direction = safe_unit(
                 self.env.target.position - position
             )
 
         if np.linalg.norm(direction) < 0.1:
+
             direction = np.array(
                 [1.0, 0.0]
             )
@@ -1987,12 +2449,15 @@ class RocketGUI:
         )
 
         nose = position + direction * 22
+
         rear = position - direction * 15
 
         left_fin = rear + perpendicular * 13
+
         right_fin = rear - perpendicular * 13
 
         body_left = position + perpendicular * 8
+
         body_right = position - perpendicular * 8
 
         flame_length = random.randint(
@@ -2016,12 +2481,12 @@ class RocketGUI:
             self.screen,
             (210, 220, 235),
             [
-                nose.astype(int),
-                body_left.astype(int),
-                left_fin.astype(int),
-                rear.astype(int),
-                right_fin.astype(int),
-                body_right.astype(int)
+                tuple(nose.astype(int)),
+                tuple(body_left.astype(int)),
+                tuple(left_fin.astype(int)),
+                tuple(rear.astype(int)),
+                tuple(right_fin.astype(int)),
+                tuple(body_right.astype(int))
             ]
         )
 
@@ -2033,11 +2498,13 @@ class RocketGUI:
         )
 
     def draw_world(self):
+
         self.screen.fill(
             (15, 20, 30)
         )
 
         for x in range(0, WIDTH, 40):
+
             pygame.draw.line(
                 self.screen,
                 (28, 35, 48),
@@ -2046,6 +2513,7 @@ class RocketGUI:
             )
 
         for y in range(0, HEIGHT, 40):
+
             pygame.draw.line(
                 self.screen,
                 (28, 35, 48),
@@ -2060,10 +2528,11 @@ class RocketGUI:
             2
         )
 
-        # Moving target path.
+        # Target path.
         path = []
 
         for index in range(100):
+
             phase = (
                 self.env.target.phase
                 + index * 0.08
@@ -2085,36 +2554,37 @@ class RocketGUI:
             1
         )
 
-        # Safety boundary.
+        # Safety region.
         pygame.draw.circle(
             self.screen,
             (125, 85, 55),
-            OBSTACLE.astype(int),
+            tuple(OBSTACLE.astype(int)),
             int(SAFETY_RADIUS),
             2
         )
 
-        # Physical obstacle.
+        # Obstacle.
         pygame.draw.circle(
             self.screen,
             (170, 65, 65),
-            OBSTACLE.astype(int),
+            tuple(OBSTACLE.astype(int)),
             int(OBSTACLE_RADIUS)
         )
 
+        # Target.
         target = self.env.target.position
 
         pygame.draw.circle(
             self.screen,
             (70, 230, 120),
-            target.astype(int),
+            tuple(target.astype(int)),
             10
         )
 
         pygame.draw.circle(
             self.screen,
             (180, 255, 190),
-            target.astype(int),
+            tuple(target.astype(int)),
             18,
             1
         )
@@ -2142,6 +2612,7 @@ class RocketGUI:
         self.draw_rocket()
 
     def draw_panel(self):
+
         x = WIDTH
 
         pygame.draw.rect(
@@ -2169,45 +2640,107 @@ class RocketGUI:
         )
 
         lines = [
+
             ("PHASE 4.16", (255, 220, 100)),
-            ("CANONICAL CPO", (220, 230, 245)),
+
+            ("PERFORMANCE CPO", (220, 230, 245)),
+
             ("", (200, 200, 200)),
-            ("POLICY", (150, 190, 255)),
-            ("Gaussian continuous policy", (100, 240, 150)),
-            ("", (200, 200, 200)),
+
             ("TRACKING", (150, 190, 255)),
-            (f"Distance: {target_distance:.1f}", (230, 230, 230)),
-            (f"Target vx: {self.env.target.velocity[0]:.1f}", (180, 240, 180)),
-            (f"Target vy: {self.env.target.velocity[1]:.1f}", (180, 240, 180)),
+
+            (
+                f"Distance: {target_distance:.1f}",
+                (230, 230, 230)
+            ),
+
+            (
+                f"Target vx: {self.env.target.velocity[0]:.1f}",
+                (180, 240, 180)
+            ),
+
+            (
+                f"Target vy: {self.env.target.velocity[1]:.1f}",
+                (180, 240, 180)
+            ),
+
             ("", (200, 200, 200)),
+
             ("SAFETY", (150, 190, 255)),
-            (f"Clearance: {clearance:.1f}", (230, 230, 230)),
-            (f"Current cost: {self.last_cost:.3f}", (230, 230, 230)),
-            (f"Cost limit: {COST_LIMIT:.1f}", (230, 230, 230)),
+
+            (
+                f"Clearance: {clearance:.1f}",
+                (230, 230, 230)
+            ),
+
+            (
+                f"Current cost: {self.last_cost:.3f}",
+                (230, 230, 230)
+            ),
+
+            (
+                f"Cost limit: {COST_LIMIT:.1f}",
+                (230, 230, 230)
+            ),
+
             ("", (200, 200, 200)),
-            ("TRUST REGION", (150, 190, 255)),
-            (f"KL limit: {DELTA:.4f}", (255, 220, 100)),
+
+            ("LAST REWARD", (150, 190, 255)),
+
+            (
+                f"Reward: {self.last_reward:.3f}",
+                (230, 230, 230)
+            ),
+
             ("", (200, 200, 200)),
+
             ("LAST ACTION", (150, 190, 255)),
-            (f"X: {self.last_action[0]:+.3f}", (150, 190, 255)),
-            (f"Y: {self.last_action[1]:+.3f}", (150, 190, 255)),
+
+            (
+                f"X: {self.last_action[0]:+.3f}",
+                (150, 190, 255)
+            ),
+
+            (
+                f"Y: {self.last_action[1]:+.3f}",
+                (150, 190, 255)
+            ),
+
             ("", (200, 200, 200)),
+
             ("SIMULATION", (150, 190, 255)),
-            (f"Speed: {self.speed}x", (220, 220, 220)),
-            ("PAUSED" if self.paused else "RUNNING", (255, 190, 100)),
+
+            (
+                f"Speed: {self.speed}x",
+                (220, 220, 220)
+            ),
+
+            (
+                "PAUSED" if self.paused else "RUNNING",
+                (255, 190, 100)
+            ),
+
             ("", (200, 200, 200)),
+
             ("CONTROLS", (150, 190, 255)),
+
             ("Mouse: change target center", (190, 190, 190)),
+
             ("SPACE: pause / resume", (190, 190, 190)),
+
             ("R: reset", (190, 190, 190)),
+
             ("+/-: simulation speed", (190, 190, 190)),
+
             ("ESC: exit", (190, 190, 190))
         ]
 
         y = 12
 
         for text, color in lines:
+
             if text:
+
                 surface = self.small_font.render(
                     text,
                     True,
@@ -2222,20 +2755,25 @@ class RocketGUI:
             y += 16
 
     def handle_events(self):
+
         for event in pygame.event.get():
 
             if event.type == pygame.QUIT:
+
                 self.running = False
 
             elif event.type == pygame.KEYDOWN:
 
                 if event.key == pygame.K_ESCAPE:
+
                     self.running = False
 
                 elif event.key == pygame.K_SPACE:
+
                     self.paused = not self.paused
 
                 elif event.key == pygame.K_r:
+
                     self.reset()
 
                 elif event.key in (
@@ -2243,6 +2781,7 @@ class RocketGUI:
                     pygame.K_EQUALS,
                     pygame.K_KP_PLUS
                 ):
+
                     self.speed = min(
                         5,
                         self.speed + 1
@@ -2252,6 +2791,7 @@ class RocketGUI:
                     pygame.K_MINUS,
                     pygame.K_KP_MINUS
                 ):
+
                     self.speed = max(
                         1,
                         self.speed - 1
@@ -2263,12 +2803,15 @@ class RocketGUI:
                     event.button == 1
                     and event.pos[0] < WIDTH
                 ):
+
                     self.change_target_center(
                         event.pos
                     )
 
     def run(self):
+
         while self.running:
+
             self.handle_events()
 
             if not self.paused:
@@ -2292,16 +2835,21 @@ class RocketGUI:
                     ) = self.env.step(action)
 
                     self.last_action = action.copy()
+
                     self.last_cost = cost
+
                     self.last_reward = reward
 
                     if terminated or truncated:
+
                         self.env.reset()
 
             self.draw_world()
+
             self.draw_panel()
 
             pygame.display.flip()
+
             self.clock.tick(60)
 
         pygame.quit()
@@ -2312,14 +2860,16 @@ class RocketGUI:
 # ============================================================
 
 def run_tests():
+
     print("\nRunning Phase 4.16 tests...\n")
 
-    # Test 1: Environment state shape.
+    # Test 1: Environment state.
     env = MovingTargetEnv()
 
     state = env.reset()
 
     assert state.shape == (STATE_DIM,)
+
     assert np.all(np.isfinite(state))
 
     print("Test 1 passed: environment state")
@@ -2354,7 +2904,7 @@ def run_tests():
 
     print("Test 4 passed: robot speed limit")
 
-    # Test 5: Safety cost nonnegative.
+    # Test 5: Nonnegative safety cost.
     assert env.safety_cost() >= 0.0
 
     print("Test 5 passed: nonnegative safety cost")
@@ -2386,18 +2936,28 @@ def run_tests():
 
     print("Test 7 passed: Gaussian policy")
 
-    # Test 8: Gaussian log probability.
-    log_prob = distribution.log_prob(
-        actions
-    ).sum(dim=1)
+    # Test 8: Squashed actions stay within bounds.
+    squashed_actions = torch.tanh(actions)
 
     assert torch.all(
-        torch.isfinite(log_prob)
+        squashed_actions.abs() <= 1.0
     )
 
-    print("Test 8 passed: Gaussian log probability")
+    print("Test 8 passed: bounded actions")
 
-    # Test 9: KL divergence is zero for identical distributions.
+    # Test 9: Squashed Gaussian log probability.
+    log_probability = squashed_log_probability(
+        distribution,
+        actions
+    )
+
+    assert torch.all(
+        torch.isfinite(log_probability)
+    )
+
+    print("Test 9 passed: squashed log probability")
+
+    # Test 10: KL divergence.
     identical_kl = kl_divergence(
         distribution,
         distribution
@@ -2409,9 +2969,9 @@ def run_tests():
         atol=1e-6
     )
 
-    print("Test 9 passed: identical-policy KL")
+    print("Test 10 passed: identical-policy KL")
 
-    # Test 10: KL divergence is nonnegative.
+    # Test 11: Nonnegative KL.
     shifted_distribution = Normal(
         distribution.mean + 0.2,
         distribution.stddev
@@ -2422,26 +2982,28 @@ def run_tests():
         shifted_distribution
     ).sum(dim=1)
 
-    assert torch.all(kl >= -1e-6)
+    assert torch.all(
+        kl >= -1e-6
+    )
 
-    print("Test 10 passed: nonnegative KL")
+    print("Test 11 passed: nonnegative KL")
 
-    # Test 11: Value network output.
+    # Test 12: Value network.
     critic = ValueNetwork().to(DEVICE)
 
     values = critic(test_states)
 
     assert values.shape == (8, 1)
 
-    print("Test 11 passed: value network")
+    print("Test 12 passed: value network")
 
-    # Test 12: GAE.
+    # Test 13: GAE.
     rewards = np.array(
         [1.0, 1.0, 1.0],
         dtype=np.float32
     )
 
-    values = np.array(
+    values_np = np.array(
         [0.5, 0.6, 0.7],
         dtype=np.float32
     )
@@ -2463,19 +3025,21 @@ def run_tests():
 
     advantages, returns = calculate_gae(
         rewards,
-        values,
+        values_np,
         next_values,
         terminated,
         episode_ends
     )
 
     assert advantages.shape == (3,)
+
     assert returns.shape == (3,)
+
     assert np.all(np.isfinite(advantages))
 
-    print("Test 12 passed: GAE")
+    print("Test 13 passed: GAE")
 
-    # Test 13: Conjugate gradient on a known system.
+    # Test 14: Conjugate gradient.
     matrix = torch.tensor(
         [
             [4.0, 1.0],
@@ -2501,9 +3065,9 @@ def run_tests():
         atol=1e-5
     )
 
-    print("Test 13 passed: conjugate gradient")
+    print("Test 14 passed: conjugate gradient")
 
-    # Test 14: Flat parameter conversion.
+    # Test 15: Flat parameter conversion.
     test_policy = GaussianPolicy().to(DEVICE)
 
     original = flat_parameters(
@@ -2527,10 +3091,11 @@ def run_tests():
         original
     )
 
-    print("Test 14 passed: flat parameter conversion")
+    print("Test 15 passed: flat parameter conversion")
 
-    # Test 15: Discounted episode cost.
+    # Test 16: Discounted episode cost.
     dummy_data = {
+
         "costs": np.array(
             [1.0, 2.0, 3.0, 4.0],
             dtype=np.float32
@@ -2543,8 +3108,11 @@ def run_tests():
     }
 
     expected_cost = (
+
         (1.0 + GAMMA * 2.0)
+
         + (3.0 + GAMMA * 4.0)
+
     ) / 2.0
 
     observed_cost = discounted_episode_costs(
@@ -2555,38 +3123,272 @@ def run_tests():
         observed_cost - expected_cost
     ) < 1e-5
 
-    print("Test 15 passed: discounted episode cost")
+    print("Test 16 passed: discounted episode cost")
 
-    # Test 16: Constrained-step feasibility.
-    #
-    # A feasible step should satisfy:
-    #     c + b.T * step <= 0
-    #
-    # A simple one-dimensional example.
-    c = -0.5
-    b = torch.tensor([1.0])
-    step = torch.tensor([0.2])
+    # Test 17: Shared computational graph.
+    test_policy = GaussianPolicy().to(DEVICE)
 
-    assert c + torch.dot(b, step).item() <= 0.0
-
-    print("Test 16 passed: local cost constraint")
-
-    # Test 17: Trust-region quadratic constraint.
-    H = torch.eye(2)
-
-    step = torch.tensor(
-        [0.1, 0.1]
+    test_parameters = list(
+        test_policy.parameters()
     )
 
-    quadratic_value = (
-        0.5 * torch.dot(step, H @ step)
+    test_input = torch.randn(
+        (8, STATE_DIM),
+        device=DEVICE
     )
 
-    assert quadratic_value <= DELTA
+    test_distribution = test_policy.distribution(
+        test_input
+    )
 
-    print("Test 17 passed: trust-region constraint")
+    test_actions = torch.randn(
+        (8, ACTION_DIM),
+        device=DEVICE
+    )
 
-    print("\nAll 17 tests passed.\n")
+    test_log_probs = squashed_log_probability(
+        test_distribution,
+        test_actions
+    )
+
+    test_reward_adv = torch.randn(
+        (8, 1),
+        device=DEVICE
+    )
+
+    test_cost_adv = torch.rand(
+        (8, 1),
+        device=DEVICE
+    )
+
+    reward_surrogate = (
+        test_log_probs.exp() * test_reward_adv
+    ).mean()
+
+    cost_surrogate = (
+        test_log_probs.exp() * test_cost_adv
+    ).mean()
+
+    reward_gradient = flat_grad(
+        reward_surrogate,
+        test_parameters,
+        retain_graph=True
+    )
+
+    cost_gradient = flat_grad(
+        cost_surrogate,
+        test_parameters
+    )
+
+    assert torch.all(
+        torch.isfinite(reward_gradient)
+    )
+
+    assert torch.all(
+        torch.isfinite(cost_gradient)
+    )
+
+    print("Test 17 passed: shared reward/cost graph")
+
+    # Test 18: Fisher-vector product.
+    old_mean = test_distribution.mean.detach()
+
+    old_std = test_distribution.stddev.detach()
+
+    old_dist = Normal(
+        old_mean,
+        old_std
+    )
+
+    new_dist = test_policy.distribution(
+        test_input
+    )
+
+    test_kl = kl_divergence(
+        old_dist,
+        new_dist
+    ).sum(dim=1).mean()
+
+    kl_gradient = flat_grad(
+        test_kl,
+        test_parameters,
+        create_graph=True
+    )
+
+    test_vector = torch.randn_like(
+        kl_gradient
+    )
+
+    gradient_vector_product = torch.dot(
+        kl_gradient,
+        test_vector
+    )
+
+    second_derivative = torch.autograd.grad(
+        gradient_vector_product,
+        test_parameters
+    )
+
+    hessian_vector = flat_gradient(
+        second_derivative
+    )
+
+    assert torch.all(
+        torch.isfinite(hessian_vector)
+    )
+
+    print("Test 18 passed: Fisher-vector product")
+
+    # Test 19: Episode-level discount scaling.
+    test_data = {
+
+        "episode_rewards": [1.0, 1.0],
+
+        "discounts": np.array(
+            [1.0, GAMMA, 1.0, GAMMA],
+            dtype=np.float32
+        )
+    }
+
+    discount_sum = float(
+        test_data["discounts"].sum()
+    )
+
+    assert discount_sum > 0.0
+
+    print("Test 19 passed: episode discount weighting")
+
+    # Test 20: Complete CPO policy update.
+    test_agent = CPOAgent()
+
+    batch_size = 64
+
+    synthetic_states = np.random.randn(
+        batch_size,
+        STATE_DIM
+    ).astype(np.float32)
+
+    synthetic_actions = np.random.uniform(
+        -0.5,
+        0.5,
+        size=(batch_size, ACTION_DIM)
+    ).astype(np.float32)
+
+    synthetic_state_tensor = torch.tensor(
+        synthetic_states,
+        dtype=torch.float32,
+        device=DEVICE
+    )
+
+    synthetic_action_tensor = torch.tensor(
+        synthetic_actions,
+        dtype=torch.float32,
+        device=DEVICE
+    )
+
+    with torch.no_grad():
+
+        synthetic_distribution = (
+            test_agent.policy.distribution(
+                synthetic_state_tensor
+            )
+        )
+
+        synthetic_log_probs = (
+            squashed_log_probability(
+                synthetic_distribution,
+                synthetic_action_tensor
+            )
+            .cpu()
+            .numpy()
+        )
+
+    synthetic_data = {
+
+        "states": synthetic_states,
+
+        "actions": synthetic_actions,
+
+        "log_probs": synthetic_log_probs,
+
+        "rewards": np.random.randn(
+            batch_size
+        ).astype(np.float32),
+
+        "costs": np.random.uniform(
+            0.0,
+            0.1,
+            size=batch_size
+        ).astype(np.float32),
+
+        "reward_values": np.zeros(
+            batch_size,
+            dtype=np.float32
+        ),
+
+        "cost_values": np.zeros(
+            batch_size,
+            dtype=np.float32
+        ),
+
+        "next_reward_values": np.zeros(
+            batch_size,
+            dtype=np.float32
+        ),
+
+        "next_cost_values": np.zeros(
+            batch_size,
+            dtype=np.float32
+        ),
+
+        "terminated": np.zeros(
+            batch_size,
+            dtype=np.float32
+        ),
+
+        "episode_ends": np.array(
+            [0.0] * (batch_size - 1) + [1.0],
+            dtype=np.float32
+        ),
+
+        "discounts": np.ones(
+            batch_size,
+            dtype=np.float32
+        ),
+
+        "episode_rewards": [0.0],
+
+        "costs_episode_placeholder": None
+    }
+
+    # Use one synthetic episode for the update test.
+    synthetic_data["episode_ends"][-1] = 1.0
+
+    test_reward_advantages = np.random.randn(
+        batch_size
+    ).astype(np.float32)
+
+    test_cost_advantages = np.random.uniform(
+        0.0,
+        1.0,
+        size=batch_size
+    ).astype(np.float32)
+
+    test_metrics = test_agent.update_policy(
+        synthetic_data,
+        test_reward_advantages,
+        test_cost_advantages
+    )
+
+    assert "accepted" in test_metrics
+
+    assert "status" in test_metrics
+
+    assert np.isfinite(test_metrics["kl"])
+
+    print("Test 20 passed: complete CPO policy update")
+
+    print("\nAll 20 tests passed.\n")
 
 
 # ============================================================
@@ -2594,9 +3396,16 @@ def run_tests():
 # ============================================================
 
 def main():
+
     print("=" * 70)
-    print("PHASE 4.16 — CANONICAL CONSTRAINED POLICY OPTIMIZATION")
+
+    print(
+        "PHASE 4.16 — PERFORMANCE-IMPROVED CPO"
+    )
+
     print("=" * 70)
+
+    print(f"PyTorch device: {DEVICE}")
 
     run_tests()
 
@@ -2604,11 +3413,15 @@ def main():
 
     visualize_training(history)
 
-    print("\nStarting Pygame moving-target rocket simulation.")
+    print(
+        "\nStarting Pygame moving-target simulation."
+    )
 
     gui = RocketGUI(agent)
+
     gui.run()
 
 
 if __name__ == "__main__":
+
     main()

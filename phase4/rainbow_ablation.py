@@ -20,11 +20,11 @@
 #
 # EXPERIMENT DESIGN
 #   Every experiment uses the same environment.
-#   Each variant has the same episode budget.
+#   Each variant has the same extended episode budget (350 episodes).
 #   Random seeds are controlled.
 #
 # IMPORTANT
-#   This is a compact educational ablation framework.
+#   This is an educational ablation framework with an extended training budget.
 #   It is not a reproduction of the original Rainbow paper.
 #   Results from one seed are not statistically conclusive.
 #
@@ -86,23 +86,23 @@ STATE_SIZE = 8
 NUM_ACTIONS = 9
 
 GAMMA = 0.99
-LEARNING_RATE = 0.0003
+LEARNING_RATE = 0.0001
 
 HIDDEN = 128
 BATCH_SIZE = 64
-REPLAY_CAPACITY = 15_000
-WARMUP = 500
+REPLAY_CAPACITY = 30_000
+WARMUP = 1_000
 
-EPISODES = 100
-MAX_STEPS = 150
+EPISODES = 350
+MAX_STEPS = 220
 
-TARGET_UPDATE = 250
+TARGET_UPDATE = 500
 
 N_STEP = 3
 
 NUM_ATOMS = 51
-V_MIN = -20.0
-V_MAX = 20.0
+V_MIN = -40.0
+V_MAX = 120.0  # Wider support prevents C51 returns from saturating at +20.
 
 PER_ALPHA = 0.6
 PER_BETA = 0.4
@@ -242,19 +242,32 @@ class RocketEnv:
             self.position + ACTION_VECTORS[action] * 8.0
         )
 
-        reward = -0.04
+        # Dense progress reward gives the learner a useful signal on
+        # almost every step. A small time cost discourages unnecessary loops.
+        reward = -0.03
         terminated = False
         truncated = False
 
         if not safe_position(next_position):
-            reward -= 15.0
+            reward -= 20.0
             self.collision = True
             terminated = True
         else:
+            old_obstacle_distance = dist(self.position, OBSTACLE)
             self.position = next_position
             new_distance = dist(self.position, self.target)
+            new_obstacle_distance = dist(self.position, OBSTACLE)
 
-            reward += 0.12 * (old_distance - new_distance)
+            # Reward movement toward the target.
+            reward += 0.18 * (old_distance - new_distance)
+
+            # Mild proximity cost discourages hugging the safety boundary
+            # without making the agent afraid to route around the obstacle.
+            proximity = max(
+                0.0,
+                (SAFE_DISTANCE + 45.0 - new_obstacle_distance) / 45.0,
+            )
+            reward -= 0.04 * proximity
 
             if self.previous_action != 8 and action != 8:
                 old_v = ACTION_VECTORS[self.previous_action]
@@ -266,7 +279,7 @@ class RocketEnv:
             self.previous_action = action
 
             if new_distance <= 18:
-                reward += 15.0
+                reward += 25.0
                 self.success = True
                 terminated = True
 
@@ -633,15 +646,35 @@ class NStepBuffer:
         self.gamma = gamma
         self.queue = deque()
 
+    @staticmethod
+    def _field(item, name, tuple_index):
+        """Read a transition field from either a Transition or tuple."""
+        if isinstance(item, Transition):
+            return getattr(item, name)
+        return item[tuple_index]
+
     def append(self, transition):
+        """
+        Accept both Transition dataclass instances and the six-element
+        tuples produced by Agent.remember().
+
+        The environment emits (state, action, reward, next_state,
+        terminated, next_mask), so terminal detection must not assume
+        that the incoming item has a `.done` attribute.
+        """
         self.queue.append(transition)
         output = []
+
+        terminated = bool(self._field(transition, "done", 4))
 
         if len(self.queue) >= self.n:
             output.append(self._build(self.n))
             self.queue.popleft()
 
-        if transition.done:
+        # Flush all remaining shorter n-step returns at a true terminal.
+        # Time-limit truncation is flushed separately by Agent.remember(),
+        # because truncated transitions remain bootstrappable.
+        if terminated:
             while self.queue:
                 output.append(
                     self._build(min(self.n, len(self.queue)))
@@ -657,18 +690,28 @@ class NStepBuffer:
         last = items[-1]
 
         reward = sum(
-            (self.gamma ** i) * item[2]
+            (self.gamma ** i)
+            * float(self._field(item, "reward", 2))
             for i, item in enumerate(items)
         )
 
         return Transition(
-            state=first[0].copy(),
-            action=first[1],
+            state=np.asarray(
+                self._field(first, "state", 0),
+                dtype=np.float32,
+            ).copy(),
+            action=int(self._field(first, "action", 1)),
             reward=float(reward),
-            next_state=last[3].copy(),
-            done=last[4],
+            next_state=np.asarray(
+                self._field(last, "next_state", 3),
+                dtype=np.float32,
+            ).copy(),
+            done=bool(self._field(last, "done", 4)),
             gamma_n=self.gamma ** count,
-            next_mask=last[5].copy(),
+            next_mask=np.asarray(
+                self._field(last, "next_mask", 5),
+                dtype=bool,
+            ).copy(),
         )
 
 
@@ -837,7 +880,9 @@ class Agent:
             )
 
             with torch.no_grad():
-                self.online.reset_noise()
+                # Keep the online noise fixed for the whole optimization
+                # step. Resampling here would modify epsilon buffers that
+                # the current-state forward pass saved for backward().
                 self.target.reset_noise()
 
                 online_next = self.online.q_values(next_states)
@@ -1039,7 +1084,7 @@ def run_experiment(config, seed):
                 mask,
                 epsilon=max(
                     0.03,
-                    0.25 * (1 - episode / EPISODES),
+                    0.35 * (1.0 - episode / (EPISODES * 0.75)),
                 ),
             )
 
@@ -1213,6 +1258,11 @@ class RocketGUI:
         self.agent = agent
         self.config = config
 
+        # Evaluation mode disables NoisyNet perturbations so the displayed
+        # policy is stable and repeatable.
+        self.agent.online.eval()
+        self.agent.target.eval()
+
         self.paused = False
         self.running = True
         self.speed = 1
@@ -1248,7 +1298,7 @@ class RocketGUI:
 
         self.screen.blit(
             font.render(str(value), True, color),
-            (x, y),
+            (int(x), int(y)),
         )
 
     def draw_rocket(self):

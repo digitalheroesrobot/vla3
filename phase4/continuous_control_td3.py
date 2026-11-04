@@ -3,73 +3,54 @@
 # File: phase4/continuous_control_td3.py
 #
 # PHASE 4.9 — CONTINUOUS CONTROL WITH DDPG AND TD3
+# IMPROVED VERSION — OBSTACLE AVOIDANCE
 #
 # PURPOSE
-#   Replace discrete movement decisions with continuous control.
+#   Learn continuous steering and thrust control.
 #
-# WHAT YOU LEARN
-#   Step 1: Continuous action spaces
-#   Step 2: Actor network
-#   Step 3: Critic network
-#   Step 4: Deterministic policy gradient
-#   Step 5: DDPG algorithm
-#   Step 6: TD3 improvements
-#   Step 7: Replay buffer and target networks
-#   Step 8: Training a continuous-control rocket
-#   Step 9: Pygame visualization
-#   Step 10: Numerical verification and tests
+# IMPROVEMENTS
+#   1. Better obstacle-aware state representation.
+#   2. Continuous obstacle proximity penalty.
+#   3. Stronger collision and success rewards.
+#   4. Repeated obstacle-crossing training scenarios.
+#   5. More training episodes.
+#   6. TD3 twin critics.
+#   7. Delayed actor updates.
+#   8. Target policy smoothing.
+#   9. Deterministic evaluation.
+#  10. Pygame visualization.
 #
-# KEY FORMULAS
+# STATE:
+#   0  target_dx
+#   1  target_dy
+#   2  target_distance
+#   3  sin(target_angle_error)
+#   4  cos(target_angle_error)
+#   5  velocity_x
+#   6  velocity_y
+#   7  obstacle_dx
+#   8  obstacle_dy
+#   9  obstacle_clearance
+#   10 sin(obstacle_angle_error)
+#   11 cos(obstacle_angle_error)
 #
-#   Actor:
-#       a = mu(s | theta)
+# ACTION:
+#   action[0] = steering [-1, 1]
+#   action[1] = thrust   [-1, 1]
 #
-#   Critic:
-#       Q(s, a | phi)
-#
-#   DDPG target:
-#       y = r + gamma * Q_target(s', mu_target(s'))
-#
-#   Deterministic policy gradient:
-#       grad J(theta)
-#       = E[ grad_a Q(s,a) * grad_theta mu(s) ]
-#
-#   TD3 target:
-#       a' = mu_target(s') + clipped_noise
-#
-#       y = r + gamma * (1-done)
-#               * min(Q1_target(s',a'), Q2_target(s',a'))
-#
-#   TD3 improvements:
-#       1. Twin critics reduce overestimation.
-#       2. Delayed actor updates improve stability.
-#       3. Target policy smoothing reduces exploitation
-#          of narrow critic errors.
-#
-# ROBOTICS APPLICATION
-#   A mobile robot uses continuous steering and thrust
-#   to approach a target while avoiding an obstacle.
-#
-# PYGAME CONTROLS
-#   Left click : Change target
-#   SPACE      : Pause / resume
-#   R          : Reset simulation
-#   +/-        : Change simulation speed
-#   ESC        : Exit
-#
-# INSTALL
+# INSTALL:
 #   pip install numpy pygame torch matplotlib
 #
-# RUN
+# RUN:
 #   python phase4/continuous_control_td3.py
 # ============================================================
 
 from __future__ import annotations
 
-import copy
 import math
 import random
 import time
+
 from collections import deque
 from dataclasses import dataclass
 
@@ -104,19 +85,19 @@ OBSTACLE = np.array(
 
 OBSTACLE_RADIUS = 55.0
 ROCKET_RADIUS = 12.0
-SAFE_DISTANCE = OBSTACLE_RADIUS + ROCKET_RADIUS + 22.0
 
-STATE_SIZE = 10
+SAFE_DISTANCE = (
+    OBSTACLE_RADIUS
+    + ROCKET_RADIUS
+    + 22.0
+)
+
+# Reward obstacle proximity when clearance
+# falls below this distance.
+OBSTACLE_WARNING_DISTANCE = 145.0
+
+STATE_SIZE = 12
 ACTION_SIZE = 2
-
-# Continuous action:
-#
-# action[0] = steering command in [-1, 1]
-# action[1] = thrust command in [-1, 1]
-#
-# Negative thrust means reverse thrust.
-# Negative steering means turn left.
-# Positive steering means turn right.
 
 GAMMA = 0.99
 TAU = 0.005
@@ -124,19 +105,20 @@ TAU = 0.005
 ACTOR_LR = 1e-4
 CRITIC_LR = 3e-4
 
-BUFFER_CAPACITY = 100_000
-BATCH_SIZE = 128
-WARMUP_STEPS = 1_000
+BUFFER_CAPACITY = 200_000
 
-TRAINING_EPISODES = 180
-MAX_STEPS = 250
+BATCH_SIZE = 128
+WARMUP_STEPS = 1500
+
+TRAINING_EPISODES = 300
+MAX_STEPS = 350
 
 POLICY_DELAY = 2
 
 TARGET_NOISE = 0.2
 NOISE_CLIP = 0.5
 
-EXPLORATION_NOISE = 0.20
+EXPLORATION_NOISE = 0.25
 
 MAX_SPEED = 5.0
 MAX_ANGULAR_SPEED = 0.09
@@ -145,9 +127,19 @@ DT = 1.0
 
 HIDDEN = 256
 
+SUCCESS_DISTANCE = 22.0
+
+# Every third episode uses the same obstacle-crossing task.
+CHALLENGE_INTERVAL = 3
+
+EVALUATION_EPISODES = 20
+
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
 
 
 # ============================================================
@@ -155,10 +147,14 @@ torch.manual_seed(SEED)
 # ============================================================
 
 def distance(a, b):
-    return float(np.linalg.norm(a - b))
+
+    return float(
+        np.linalg.norm(a - b)
+    )
 
 
 def clamp_action(action):
+
     return np.clip(
         action,
         -1.0,
@@ -166,28 +162,36 @@ def clamp_action(action):
     ).astype(np.float32)
 
 
+def wrap_angle(angle):
+
+    return (
+        angle + math.pi
+    ) % (2.0 * math.pi) - math.pi
+
+
 def soft_update(source, target, tau=TAU):
-    """
-    Polyak averaging:
-
-        target = tau * source + (1-tau) * target
-
-    A small tau produces slowly changing target networks.
-    """
 
     with torch.no_grad():
+
         for source_param, target_param in zip(
             source.parameters(),
             target.parameters(),
         ):
-            target_param.data.mul_(1.0 - tau)
+
+            target_param.data.mul_(
+                1.0 - tau
+            )
+
             target_param.data.add_(
                 tau * source_param.data
             )
 
 
 def hard_update(source, target):
-    target.load_state_dict(source.state_dict())
+
+    target.load_state_dict(
+        source.state_dict()
+    )
 
 
 # ============================================================
@@ -195,6 +199,7 @@ def hard_update(source, target):
 # ============================================================
 
 def safe_position(position):
+
     x, y = position
 
     inside_world = (
@@ -206,17 +211,23 @@ def safe_position(position):
         distance(position, OBSTACLE) >= SAFE_DISTANCE
     )
 
-    return inside_world and outside_obstacle
+    return (
+        inside_world
+        and outside_obstacle
+    )
 
 
 class ContinuousRocketEnv:
 
     def __init__(self):
+
         self.reset()
 
     def random_safe_position(self):
+
         for _ in range(5000):
-            p = np.array(
+
+            position = np.array(
                 [
                     random.uniform(35, WORLD_W - 35),
                     random.uniform(35, WORLD_H - 35),
@@ -224,27 +235,80 @@ class ContinuousRocketEnv:
                 dtype=np.float32,
             )
 
-            if safe_position(p):
-                return p
+            if safe_position(position):
 
-        raise RuntimeError("Cannot find safe position.")
+                return position
 
-    def reset(self):
-        self.position = self.random_safe_position()
+        raise RuntimeError(
+            "Could not find a safe position."
+        )
 
-        self.target = self.random_safe_position()
+    def reset(
+        self,
+        start=None,
+        target=None,
+        heading=None,
+    ):
 
-        while distance(self.position, self.target) < 230:
+        if start is None:
+
+            self.position = self.random_safe_position()
+
+        else:
+
+            self.position = np.asarray(
+                start,
+                dtype=np.float32,
+            ).copy()
+
+        if target is None:
+
             self.target = self.random_safe_position()
+
+            attempts = 0
+
+            while (
+                distance(self.position, self.target) < 230
+                and attempts < 100
+            ):
+
+                self.target = self.random_safe_position()
+
+                attempts += 1
+
+        else:
+
+            self.target = np.asarray(
+                target,
+                dtype=np.float32,
+            ).copy()
+
+        if not safe_position(self.position):
+
+            raise ValueError(
+                "Initial rocket position is unsafe."
+            )
+
+        if not safe_position(self.target):
+
+            raise ValueError(
+                "Target position is unsafe."
+            )
+
+        if heading is None:
+
+            self.heading = random.uniform(
+                -math.pi,
+                math.pi,
+            )
+
+        else:
+
+            self.heading = float(heading)
 
         self.velocity = np.zeros(
             2,
             dtype=np.float32,
-        )
-
-        self.heading = random.uniform(
-            -math.pi,
-            math.pi,
         )
 
         self.steps = 0
@@ -254,6 +318,8 @@ class ContinuousRocketEnv:
         self.success = False
         self.collision = False
 
+        self.minimum_obstacle_clearance = float("inf")
+
         self.previous_distance = distance(
             self.position,
             self.target,
@@ -262,15 +328,21 @@ class ContinuousRocketEnv:
         return self.get_state()
 
     def set_target(self, target):
+
         target = np.asarray(
             target,
             dtype=np.float32,
         )
 
         if not safe_position(target):
+
             return False
 
-        if distance(target, self.position) < 25:
+        if distance(
+            target,
+            self.position,
+        ) < 25:
+
             return False
 
         self.target = target
@@ -288,21 +360,57 @@ class ContinuousRocketEnv:
 
         return True
 
+    def get_obstacle_clearance(self):
+
+        obstacle_distance = distance(
+            self.position,
+            OBSTACLE,
+        )
+
+        return (
+            obstacle_distance
+            - SAFE_DISTANCE
+        )
+
     def get_state(self):
-        target_delta = self.target - self.position
 
-        obstacle_delta = OBSTACLE - self.position
+        target_delta = (
+            self.target - self.position
+        )
 
-        target_distance = np.linalg.norm(target_delta)
+        obstacle_delta = (
+            OBSTACLE - self.position
+        )
+
+        target_distance = np.linalg.norm(
+            target_delta
+        )
+
+        obstacle_distance = np.linalg.norm(
+            obstacle_delta
+        )
 
         target_angle = math.atan2(
             target_delta[1],
             target_delta[0],
         )
 
-        angle_error = (
-            target_angle - self.heading + math.pi
-        ) % (2 * math.pi) - math.pi
+        obstacle_angle = math.atan2(
+            obstacle_delta[1],
+            obstacle_delta[0],
+        )
+
+        target_angle_error = wrap_angle(
+            target_angle - self.heading
+        )
+
+        obstacle_angle_error = wrap_angle(
+            obstacle_angle - self.heading
+        )
+
+        obstacle_clearance = (
+            obstacle_distance - SAFE_DISTANCE
+        )
 
         return np.array(
             [
@@ -311,8 +419,8 @@ class ContinuousRocketEnv:
 
                 target_distance / 900.0,
 
-                math.sin(angle_error),
-                math.cos(angle_error),
+                math.sin(target_angle_error),
+                math.cos(target_angle_error),
 
                 self.velocity[0] / MAX_SPEED,
                 self.velocity[1] / MAX_SPEED,
@@ -320,10 +428,10 @@ class ContinuousRocketEnv:
                 obstacle_delta[0] / WORLD_W,
                 obstacle_delta[1] / WORLD_H,
 
-                (
-                    np.linalg.norm(obstacle_delta)
-                    - SAFE_DISTANCE
-                ) / 900.0,
+                obstacle_clearance / 200.0,
+
+                math.sin(obstacle_angle_error),
+                math.cos(obstacle_angle_error),
             ],
             dtype=np.float32,
         )
@@ -335,19 +443,20 @@ class ContinuousRocketEnv:
         steering = float(action[0])
         thrust = float(action[1])
 
-        old_position = self.position.copy()
-
         old_distance = distance(
             self.position,
             self.target,
         )
 
         # ----------------------------------------------------
-        # Continuous vehicle dynamics
+        # VEHICLE DYNAMICS
         # ----------------------------------------------------
 
-        self.heading += (
-            steering * MAX_ANGULAR_SPEED * DT
+        self.heading = wrap_angle(
+            self.heading
+            + steering
+            * MAX_ANGULAR_SPEED
+            * DT
         )
 
         forward = np.array(
@@ -358,36 +467,44 @@ class ContinuousRocketEnv:
             dtype=np.float32,
         )
 
-        acceleration = forward * thrust * 0.22
+        acceleration = (
+            forward * thrust * 0.22
+        )
 
         self.velocity += acceleration
 
-        # Damping prevents unlimited acceleration.
         self.velocity *= 0.96
 
-        speed = np.linalg.norm(self.velocity)
-
-        if speed > MAX_SPEED:
-            self.velocity *= MAX_SPEED / speed
-
-        candidate_position = (
-            self.position + self.velocity * DT
+        speed = np.linalg.norm(
+            self.velocity
         )
 
-        reward = -0.03
+        if speed > MAX_SPEED:
+
+            self.velocity *= (
+                MAX_SPEED / speed
+            )
+
+        candidate_position = (
+            self.position
+            + self.velocity * DT
+        )
+
+        reward = 0.0
 
         terminated = False
         truncated = False
 
         # ----------------------------------------------------
-        # Safety check
+        # COLLISION CHECK
         # ----------------------------------------------------
 
         if not safe_position(candidate_position):
 
-            reward -= 20.0
+            reward -= 100.0
 
             self.collision = True
+
             terminated = True
 
         else:
@@ -399,28 +516,109 @@ class ContinuousRocketEnv:
                 self.target,
             )
 
-            # Reward progress toward target.
-            progress = old_distance - new_distance
+            # ------------------------------------------------
+            # 1. TARGET PROGRESS
+            # ------------------------------------------------
 
-            reward += 0.20 * progress
+            progress = (
+                old_distance - new_distance
+            )
 
-            # Small velocity penalty discourages unnecessary
-            # oscillation and excessive movement.
-            reward -= 0.015 * np.linalg.norm(self.velocity)
+            reward += (
+                0.15 * progress
+            )
 
-            # Reward approaching the target.
-            if new_distance < 35:
-                reward += 0.3
+            # ------------------------------------------------
+            # 2. TARGET ALIGNMENT
+            # ------------------------------------------------
 
-            if new_distance < 20:
-                reward += 25.0
+            target_delta = (
+                self.target - self.position
+            )
+
+            target_angle = math.atan2(
+                target_delta[1],
+                target_delta[0],
+            )
+
+            angle_error = wrap_angle(
+                target_angle - self.heading
+            )
+
+            reward += (
+                0.08 * math.cos(angle_error)
+            )
+
+            # ------------------------------------------------
+            # 3. OBSTACLE PROXIMITY PENALTY
+            #
+            # This is the main obstacle-avoidance change.
+            #
+            # The rocket receives a penalty before collision.
+            # ------------------------------------------------
+
+            clearance = self.get_obstacle_clearance()
+
+            self.minimum_obstacle_clearance = min(
+                self.minimum_obstacle_clearance,
+                clearance,
+            )
+
+            danger = max(
+                0.0,
+                OBSTACLE_WARNING_DISTANCE - clearance,
+            )
+
+            reward -= (
+                0.035 * danger
+            )
+
+            # ------------------------------------------------
+            # 4. TARGET PROXIMITY REWARD
+            # ------------------------------------------------
+
+            reward += (
+                0.25
+                * math.exp(-new_distance / 100.0)
+            )
+
+            # ------------------------------------------------
+            # 5. SPEED PENALTY
+            # ------------------------------------------------
+
+            reward -= (
+                0.01
+                * np.linalg.norm(self.velocity)
+            )
+
+            # ------------------------------------------------
+            # 6. ACTION SMOOTHNESS
+            # ------------------------------------------------
+
+            reward -= (
+                0.025 * steering ** 2
+                + 0.008 * thrust ** 2
+            )
+
+            # ------------------------------------------------
+            # 7. SUCCESS
+            # ------------------------------------------------
+
+            if new_distance < SUCCESS_DISTANCE:
+
+                reward += 100.0
 
                 self.success = True
+
                 terminated = True
 
         self.steps += 1
 
-        if self.steps >= MAX_STEPS and not terminated:
+        if (
+            self.steps >= MAX_STEPS
+            and not terminated
+        ):
+
             truncated = True
 
         self.total_reward += reward
@@ -445,28 +643,34 @@ class ContinuousRocketEnv:
 class Actor(nn.Module):
 
     def __init__(self):
+
         super().__init__()
 
         self.network = nn.Sequential(
-            nn.Linear(STATE_SIZE, HIDDEN),
+
+            nn.Linear(
+                STATE_SIZE,
+                HIDDEN,
+            ),
+
             nn.ReLU(),
 
-            nn.Linear(HIDDEN, HIDDEN),
+            nn.Linear(
+                HIDDEN,
+                HIDDEN,
+            ),
+
             nn.ReLU(),
 
-            nn.Linear(HIDDEN, ACTION_SIZE),
+            nn.Linear(
+                HIDDEN,
+                ACTION_SIZE,
+            ),
+
             nn.Tanh(),
         )
 
     def forward(self, state):
-        """
-        Output range:
-
-            steering in [-1, 1]
-            thrust in [-1, 1]
-
-        Tanh constrains the continuous action.
-        """
 
         return self.network(state)
 
@@ -478,22 +682,33 @@ class Actor(nn.Module):
 class Critic(nn.Module):
 
     def __init__(self):
+
         super().__init__()
 
         self.network = nn.Sequential(
+
             nn.Linear(
                 STATE_SIZE + ACTION_SIZE,
                 HIDDEN,
             ),
+
             nn.ReLU(),
 
-            nn.Linear(HIDDEN, HIDDEN),
+            nn.Linear(
+                HIDDEN,
+                HIDDEN,
+            ),
+
             nn.ReLU(),
 
-            nn.Linear(HIDDEN, 1),
+            nn.Linear(
+                HIDDEN,
+                1,
+            ),
         )
 
     def forward(self, state, action):
+
         x = torch.cat(
             [state, action],
             dim=1,
@@ -508,6 +723,7 @@ class Critic(nn.Module):
 
 @dataclass
 class Transition:
+
     state: np.ndarray
     action: np.ndarray
     reward: float
@@ -518,7 +734,10 @@ class Transition:
 class ReplayBuffer:
 
     def __init__(self, capacity):
-        self.memory = deque(maxlen=capacity)
+
+        self.memory = deque(
+            maxlen=capacity
+        )
 
     def add(
         self,
@@ -528,30 +747,51 @@ class ReplayBuffer:
         next_state,
         terminated,
     ):
+
         self.memory.append(
             Transition(
-                state=state.copy(),
-                action=action.copy(),
+                state=np.asarray(
+                    state,
+                    dtype=np.float32,
+                ).copy(),
+
+                action=np.asarray(
+                    action,
+                    dtype=np.float32,
+                ).copy(),
+
                 reward=float(reward),
-                next_state=next_state.copy(),
+
+                next_state=np.asarray(
+                    next_state,
+                    dtype=np.float32,
+                ).copy(),
+
                 done=float(terminated),
             )
         )
 
     def sample(self, batch_size):
 
+        if len(self.memory) < batch_size:
+
+            raise ValueError(
+                f"Replay buffer has {len(self.memory)} "
+                f"transitions; {batch_size} required."
+            )
+
         batch = random.sample(
-            self.memory,
+            list(self.memory),
             batch_size,
         )
 
         states = np.stack(
             [t.state for t in batch]
-        )
+        ).astype(np.float32)
 
         actions = np.stack(
             [t.action for t in batch]
-        )
+        ).astype(np.float32)
 
         rewards = np.array(
             [t.reward for t in batch],
@@ -560,7 +800,7 @@ class ReplayBuffer:
 
         next_states = np.stack(
             [t.next_state for t in batch]
-        )
+        ).astype(np.float32)
 
         dones = np.array(
             [t.done for t in batch],
@@ -568,27 +808,32 @@ class ReplayBuffer:
         ).reshape(-1, 1)
 
         return (
-            torch.tensor(
+
+            torch.as_tensor(
                 states,
                 dtype=torch.float32,
                 device=DEVICE,
             ),
-            torch.tensor(
+
+            torch.as_tensor(
                 actions,
                 dtype=torch.float32,
                 device=DEVICE,
             ),
-            torch.tensor(
+
+            torch.as_tensor(
                 rewards,
                 dtype=torch.float32,
                 device=DEVICE,
             ),
-            torch.tensor(
+
+            torch.as_tensor(
                 next_states,
                 dtype=torch.float32,
                 device=DEVICE,
             ),
-            torch.tensor(
+
+            torch.as_tensor(
                 dones,
                 dtype=torch.float32,
                 device=DEVICE,
@@ -596,6 +841,7 @@ class ReplayBuffer:
         )
 
     def __len__(self):
+
         return len(self.memory)
 
 
@@ -608,9 +854,11 @@ class DDPGAgent:
     def __init__(self):
 
         self.actor = Actor().to(DEVICE)
+
         self.actor_target = Actor().to(DEVICE)
 
         self.critic = Critic().to(DEVICE)
+
         self.critic_target = Critic().to(DEVICE)
 
         hard_update(
@@ -634,10 +882,11 @@ class DDPGAgent:
         )
 
         self.replay = ReplayBuffer(
-            BUFFER_CAPACITY,
+            BUFFER_CAPACITY
         )
 
         self.losses = []
+        self.actor_losses = []
 
         self.training_steps = 0
 
@@ -647,7 +896,7 @@ class DDPGAgent:
         exploration_noise=0.0,
     ):
 
-        state_t = torch.tensor(
+        state_t = torch.as_tensor(
             state,
             dtype=torch.float32,
             device=DEVICE,
@@ -656,13 +905,19 @@ class DDPGAgent:
         self.actor.eval()
 
         with torch.no_grad():
-            action = self.actor(state_t).cpu().numpy()[0]
+
+            action = (
+                self.actor(state_t)
+                .cpu()
+                .numpy()[0]
+            )
 
         self.actor.train()
 
         if exploration_noise > 0:
+
             action += np.random.normal(
-                0,
+                0.0,
                 exploration_noise,
                 size=ACTION_SIZE,
             )
@@ -675,6 +930,7 @@ class DDPGAgent:
             BATCH_SIZE,
             WARMUP_STEPS,
         ):
+
             return None
 
         (
@@ -683,13 +939,12 @@ class DDPGAgent:
             rewards,
             next_states,
             dones,
-        ) = self.replay.sample(BATCH_SIZE)
+        ) = self.replay.sample(
+            BATCH_SIZE
+        )
 
         # ----------------------------------------------------
-        # Critic update
-        #
-        # y = r + gamma * (1-done)
-        #                 * Q_target(s', actor_target(s'))
+        # DDPG TARGET
         # ----------------------------------------------------
 
         with torch.no_grad():
@@ -705,8 +960,14 @@ class DDPGAgent:
 
             y = (
                 rewards
-                + GAMMA * (1.0 - dones) * target_q
+                + GAMMA
+                * (1.0 - dones)
+                * target_q
             )
+
+        # ----------------------------------------------------
+        # CRITIC UPDATE
+        # ----------------------------------------------------
 
         current_q = self.critic(
             states,
@@ -718,7 +979,9 @@ class DDPGAgent:
             y,
         )
 
-        self.critic_optimizer.zero_grad()
+        self.critic_optimizer.zero_grad(
+            set_to_none=True
+        )
 
         critic_loss.backward()
 
@@ -730,12 +993,7 @@ class DDPGAgent:
         self.critic_optimizer.step()
 
         # ----------------------------------------------------
-        # Actor update
-        #
-        # Maximize:
-        #       Q(s, actor(s))
-        #
-        # Minimize negative Q.
+        # ACTOR UPDATE
         # ----------------------------------------------------
 
         actor_loss = -self.critic(
@@ -743,7 +1001,9 @@ class DDPGAgent:
             self.actor(states),
         ).mean()
 
-        self.actor_optimizer.zero_grad()
+        self.actor_optimizer.zero_grad(
+            set_to_none=True
+        )
 
         actor_loss.backward()
 
@@ -753,6 +1013,10 @@ class DDPGAgent:
         )
 
         self.actor_optimizer.step()
+
+        # ----------------------------------------------------
+        # TARGET UPDATES
+        # ----------------------------------------------------
 
         soft_update(
             self.actor,
@@ -770,6 +1034,10 @@ class DDPGAgent:
             float(critic_loss.item())
         )
 
+        self.actor_losses.append(
+            float(actor_loss.item())
+        )
+
         return float(critic_loss.item())
 
 
@@ -780,9 +1048,9 @@ class DDPGAgent:
 class TD3Agent(DDPGAgent):
 
     def __init__(self):
+
         super().__init__()
 
-        # TD3 uses two independent critics.
         self.critic2 = Critic().to(DEVICE)
 
         self.critic2_target = Critic().to(DEVICE)
@@ -797,9 +1065,9 @@ class TD3Agent(DDPGAgent):
             lr=CRITIC_LR,
         )
 
-        self.actor_updates = 0
-
         self.critic2_losses = []
+
+        self.actor_updates = 0
 
     def train_step(self):
 
@@ -807,6 +1075,7 @@ class TD3Agent(DDPGAgent):
             BATCH_SIZE,
             WARMUP_STEPS,
         ):
+
             return None
 
         (
@@ -815,16 +1084,12 @@ class TD3Agent(DDPGAgent):
             rewards,
             next_states,
             dones,
-        ) = self.replay.sample(BATCH_SIZE)
+        ) = self.replay.sample(
+            BATCH_SIZE
+        )
 
         # ----------------------------------------------------
-        # TD3 IMPROVEMENT 1:
         # TARGET POLICY SMOOTHING
-        #
-        # Add clipped noise to target actions.
-        #
-        # This prevents the critic from exploiting narrow,
-        # unrealistic peaks in its learned Q-function.
         # ----------------------------------------------------
 
         with torch.no_grad():
@@ -833,9 +1098,10 @@ class TD3Agent(DDPGAgent):
                 next_states
             )
 
-            noise = torch.randn_like(
-                next_actions
-            ) * TARGET_NOISE
+            noise = (
+                torch.randn_like(next_actions)
+                * TARGET_NOISE
+            )
 
             noise = noise.clamp(
                 -NOISE_CLIP,
@@ -844,7 +1110,14 @@ class TD3Agent(DDPGAgent):
 
             next_actions = (
                 next_actions + noise
-            ).clamp(-1.0, 1.0)
+            ).clamp(
+                -1.0,
+                1.0,
+            )
+
+            # ------------------------------------------------
+            # TWIN CRITIC MINIMUM
+            # ------------------------------------------------
 
             target_q1 = self.critic_target(
                 next_states,
@@ -856,14 +1129,6 @@ class TD3Agent(DDPGAgent):
                 next_actions,
             )
 
-            # ------------------------------------------------
-            # TD3 IMPROVEMENT 2:
-            # TWIN CRITIC MINIMUM
-            #
-            # Use the smaller Q estimate.
-            # This reduces positive overestimation bias.
-            # ------------------------------------------------
-
             target_q = torch.minimum(
                 target_q1,
                 target_q2,
@@ -871,15 +1136,16 @@ class TD3Agent(DDPGAgent):
 
             y = (
                 rewards
-                + GAMMA * (1.0 - dones) * target_q
+                + GAMMA
+                * (1.0 - dones)
+                * target_q
             )
 
-        current_q1 = self.critic(
-            states,
-            actions,
-        )
+        # ----------------------------------------------------
+        # CRITIC 1
+        # ----------------------------------------------------
 
-        current_q2 = self.critic2(
+        current_q1 = self.critic(
             states,
             actions,
         )
@@ -889,12 +1155,10 @@ class TD3Agent(DDPGAgent):
             y,
         )
 
-        loss2 = nn.functional.mse_loss(
-            current_q2,
-            y,
+        self.critic_optimizer.zero_grad(
+            set_to_none=True
         )
 
-        self.critic_optimizer.zero_grad()
         loss1.backward()
 
         nn.utils.clip_grad_norm_(
@@ -904,7 +1168,24 @@ class TD3Agent(DDPGAgent):
 
         self.critic_optimizer.step()
 
-        self.critic2_optimizer.zero_grad()
+        # ----------------------------------------------------
+        # CRITIC 2
+        # ----------------------------------------------------
+
+        current_q2 = self.critic2(
+            states,
+            actions,
+        )
+
+        loss2 = nn.functional.mse_loss(
+            current_q2,
+            y,
+        )
+
+        self.critic2_optimizer.zero_grad(
+            set_to_none=True
+        )
+
         loss2.backward()
 
         nn.utils.clip_grad_norm_(
@@ -917,11 +1198,7 @@ class TD3Agent(DDPGAgent):
         self.training_steps += 1
 
         # ----------------------------------------------------
-        # TD3 IMPROVEMENT 3:
-        # DELAYED POLICY UPDATE
-        #
-        # Update actor and target networks only once every
-        # POLICY_DELAY critic updates.
+        # DELAYED ACTOR UPDATE
         # ----------------------------------------------------
 
         if self.training_steps % POLICY_DELAY == 0:
@@ -931,7 +1208,9 @@ class TD3Agent(DDPGAgent):
                 self.actor(states),
             ).mean()
 
-            self.actor_optimizer.zero_grad()
+            self.actor_optimizer.zero_grad(
+                set_to_none=True
+            )
 
             actor_loss.backward()
 
@@ -942,6 +1221,7 @@ class TD3Agent(DDPGAgent):
 
             self.actor_optimizer.step()
 
+            # Update target networks alongside actor.
             soft_update(
                 self.actor,
                 self.actor_target,
@@ -959,6 +1239,10 @@ class TD3Agent(DDPGAgent):
 
             self.actor_updates += 1
 
+            self.actor_losses.append(
+                float(actor_loss.item())
+            )
+
         combined_loss = (
             loss1.item() + loss2.item()
         ) / 2.0
@@ -975,10 +1259,40 @@ class TD3Agent(DDPGAgent):
 
 
 # ============================================================
-# STEP 8 — TRAINING
+# STEP 8 — TRAINING SCENARIOS
 # ============================================================
 
-def train_agent(agent, episodes, name):
+def reset_training_environment(
+    env,
+    episode,
+):
+    """
+    Mix random navigation with repeated obstacle-crossing
+    scenarios.
+
+    The repeated challenge matches the Pygame demonstration.
+    """
+
+    if episode % CHALLENGE_INTERVAL == 0:
+
+        return env.reset(
+            start=[80.0, 280.0],
+            target=[620.0, 280.0],
+            heading=0.0,
+        )
+
+    return env.reset()
+
+
+# ============================================================
+# STEP 9 — TRAINING
+# ============================================================
+
+def train_agent(
+    agent,
+    episodes,
+    name,
+):
 
     env = ContinuousRocketEnv()
 
@@ -986,20 +1300,31 @@ def train_agent(agent, episodes, name):
     successes = []
     collisions = []
 
+    minimum_clearances = []
+
     started = time.time()
 
     for episode in range(episodes):
 
-        state = env.reset()
+        state = reset_training_environment(
+            env,
+            episode,
+        )
 
         episode_reward = 0.0
 
         for step in range(MAX_STEPS):
 
+            # Gradually decrease exploration.
+            progress = episode / max(
+                episodes - 1,
+                1,
+            )
+
             noise = max(
                 0.04,
                 EXPLORATION_NOISE
-                * (1.0 - episode / episodes),
+                * (1.0 - 0.75 * progress),
             )
 
             action = agent.select_action(
@@ -1007,12 +1332,13 @@ def train_agent(agent, episodes, name):
                 exploration_noise=noise,
             )
 
-            next_state, reward, terminated, truncated = (
-                env.step(action)
-            )
+            (
+                next_state,
+                reward,
+                terminated,
+                truncated,
+            ) = env.step(action)
 
-            # For a time-limit truncation, preserve bootstrapping:
-            # it is not an MDP terminal state.
             agent.replay.add(
                 state,
                 action,
@@ -1030,7 +1356,9 @@ def train_agent(agent, episodes, name):
             if terminated or truncated:
                 break
 
-        rewards.append(episode_reward)
+        rewards.append(
+            episode_reward
+        )
 
         successes.append(
             int(env.success)
@@ -1040,16 +1368,27 @@ def train_agent(agent, episodes, name):
             int(env.collision)
         )
 
+        minimum_clearances.append(
+            env.minimum_obstacle_clearance
+        )
+
         if (episode + 1) % 20 == 0:
 
-            recent = min(20, len(rewards))
+            recent = min(
+                20,
+                len(rewards),
+            )
 
             print(
                 f"{name:8s} "
                 f"Episode {episode + 1:3d}/{episodes} | "
                 f"Reward {np.mean(rewards[-recent:]):8.2f} | "
-                f"Success {100*np.mean(successes[-recent:]):5.1f}% | "
-                f"Collision {100*np.mean(collisions[-recent:]):5.1f}%"
+                f"Success "
+                f"{100*np.mean(successes[-recent:]):5.1f}% | "
+                f"Collision "
+                f"{100*np.mean(collisions[-recent:]):5.1f}% | "
+                f"Clearance "
+                f"{np.mean(minimum_clearances[-recent:]):6.1f}"
             )
 
     elapsed = time.time() - started
@@ -1059,15 +1398,145 @@ def train_agent(agent, episodes, name):
         "rewards": rewards,
         "successes": successes,
         "collisions": collisions,
+        "minimum_clearances": minimum_clearances,
         "seconds": elapsed,
     }
 
 
 # ============================================================
-# STEP 9 — TRAINING VISUALIZATION
+# STEP 10 — EVALUATION
 # ============================================================
 
-def plot_training(ddpg_result, td3_result):
+def evaluate_agent(
+    agent,
+    episodes=EVALUATION_EPISODES,
+):
+    """
+    Evaluate without exploration noise.
+
+    Uses the same obstacle-crossing scenario as Pygame.
+    """
+
+    env = ContinuousRocketEnv()
+
+    results = []
+
+    print("\nTD3 DETERMINISTIC EVALUATION")
+    print("=" * 65)
+
+    for episode in range(episodes):
+
+        state = env.reset(
+            start=[80.0, 280.0],
+            target=[620.0, 280.0],
+            heading=0.0,
+        )
+
+        episode_reward = 0.0
+
+        for step in range(MAX_STEPS):
+
+            action = agent.select_action(
+                state,
+                exploration_noise=0.0,
+            )
+
+            (
+                next_state,
+                reward,
+                terminated,
+                truncated,
+            ) = env.step(action)
+
+            state = next_state
+
+            episode_reward += reward
+
+            if terminated or truncated:
+                break
+
+        results.append(
+            {
+                "success": int(env.success),
+                "collision": int(env.collision),
+                "reward": episode_reward,
+                "steps": env.steps,
+                "clearance": env.minimum_obstacle_clearance,
+            }
+        )
+
+        print(
+            f"Episode {episode + 1:02d}/{episodes} | "
+            f"Success={env.success} | "
+            f"Collision={env.collision} | "
+            f"Steps={env.steps:3d} | "
+            f"Reward={episode_reward:8.2f} | "
+            f"Min clearance="
+            f"{env.minimum_obstacle_clearance:7.2f}"
+        )
+
+    success_rate = np.mean(
+        [r["success"] for r in results]
+    ) * 100.0
+
+    collision_rate = np.mean(
+        [r["collision"] for r in results]
+    ) * 100.0
+
+    average_steps = np.mean(
+        [r["steps"] for r in results]
+    )
+
+    print("\nEVALUATION SUMMARY")
+    print("-" * 65)
+
+    print(
+        f"Success rate:   {success_rate:.1f}%"
+    )
+
+    print(
+        f"Collision rate: {collision_rate:.1f}%"
+    )
+
+    print(
+        f"Average steps:  {average_steps:.1f}"
+    )
+
+    return results
+
+
+# ============================================================
+# STEP 11 — TRAINING VISUALIZATION
+# ============================================================
+
+def moving_average(
+    values,
+    window=15,
+):
+
+    values = np.asarray(
+        values,
+        dtype=np.float32,
+    )
+
+    if len(values) < window:
+        return values
+
+    return np.convolve(
+        values,
+        np.ones(window) / window,
+        mode="valid",
+    )
+
+
+def plot_training(
+    ddpg_result,
+    td3_result,
+):
+
+    # --------------------------------------------------------
+    # Episode reward
+    # --------------------------------------------------------
 
     plt.figure(figsize=(12, 5))
 
@@ -1076,28 +1545,102 @@ def plot_training(ddpg_result, td3_result):
         ("TD3", td3_result),
     ]:
 
-        rewards = result["rewards"]
-
-        window = 15
-
-        smooth = np.convolve(
-            rewards,
-            np.ones(window) / window,
-            mode="valid",
-        )
-
         plt.plot(
-            smooth,
+            moving_average(
+                result["rewards"],
+                15,
+            ),
             label=name,
         )
 
-    plt.title("DDPG vs TD3 — Episode Reward")
+    plt.title(
+        "DDPG vs TD3 — Episode Reward"
+    )
+
     plt.xlabel("Episode")
     plt.ylabel("Smoothed reward")
+
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
+
     plt.show()
+
+    # --------------------------------------------------------
+    # Success rate
+    # --------------------------------------------------------
+
+    plt.figure(figsize=(12, 5))
+
+    for name, result in [
+        ("DDPG", ddpg_result),
+        ("TD3", td3_result),
+    ]:
+
+        success_rate = moving_average(
+            result["successes"],
+            15,
+        )
+
+        plt.plot(
+            success_rate * 100.0,
+            label=name,
+        )
+
+    plt.title(
+        "Success Rate"
+    )
+
+    plt.xlabel("Episode")
+    plt.ylabel("Success rate (%)")
+
+    plt.ylim(0, 100)
+
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+
+    plt.show()
+
+    # --------------------------------------------------------
+    # Collision rate
+    # --------------------------------------------------------
+
+    plt.figure(figsize=(12, 5))
+
+    for name, result in [
+        ("DDPG", ddpg_result),
+        ("TD3", td3_result),
+    ]:
+
+        collision_rate = moving_average(
+            result["collisions"],
+            15,
+        )
+
+        plt.plot(
+            collision_rate * 100.0,
+            label=name,
+        )
+
+    plt.title(
+        "Collision Rate"
+    )
+
+    plt.xlabel("Episode")
+    plt.ylabel("Collision rate (%)")
+
+    plt.ylim(0, 100)
+
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+
+    plt.show()
+
+    # --------------------------------------------------------
+    # Critic losses
+    # --------------------------------------------------------
 
     plt.figure(figsize=(12, 5))
 
@@ -1111,39 +1654,32 @@ def plot_training(ddpg_result, td3_result):
             label=name,
         )
 
-    plt.title("Critic Training Loss")
+    plt.title(
+        "Critic Training Loss"
+    )
+
     plt.xlabel("Training update")
     plt.ylabel("Loss")
+
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
+
     plt.show()
-
-    print("\nFINAL PERFORMANCE")
-
-    for name, result in [
-        ("DDPG", ddpg_result),
-        ("TD3", td3_result),
-    ]:
-
-        recent = min(25, len(result["rewards"]))
-
-        print(
-            f"{name}: "
-            f"Reward={np.mean(result['rewards'][-recent:]):.2f}, "
-            f"Success={100*np.mean(result['successes'][-recent:]):.1f}%, "
-            f"Collision={100*np.mean(result['collisions'][-recent:]):.1f}%, "
-            f"Time={result['seconds']:.1f}s"
-        )
 
 
 # ============================================================
-# STEP 10 — PYGAME ROCKET SIMULATOR
+# STEP 12 — PYGAME SIMULATOR
 # ============================================================
 
 class RocketGUI:
 
-    def __init__(self, env, agent, title):
+    def __init__(
+        self,
+        env,
+        agent,
+        title,
+    ):
 
         pygame.init()
 
@@ -1174,6 +1710,7 @@ class RocketGUI:
 
         self.paused = False
         self.running = True
+
         self.speed = 1
 
         self.last_action = np.zeros(
@@ -1181,34 +1718,25 @@ class RocketGUI:
             dtype=np.float32,
         )
 
+        self.path = deque(maxlen=500)
+
         self.reset()
 
     def reset(self):
 
-        self.env.position = np.array(
-            [80.0, 280.0],
-            dtype=np.float32,
+        self.env.reset(
+            start=[80.0, 280.0],
+            target=[620.0, 280.0],
+            heading=0.0,
         )
-
-        self.env.target = np.array(
-            [620.0, 280.0],
-            dtype=np.float32,
-        )
-
-        self.env.velocity = np.zeros(
-            2,
-            dtype=np.float32,
-        )
-
-        self.env.heading = 0.0
-
-        self.env.steps = 0
-        self.env.total_reward = 0.0
-
-        self.env.success = False
-        self.env.collision = False
 
         self.last_action[:] = 0.0
+
+        self.path.clear()
+
+        self.path.append(
+            self.env.position.copy()
+        )
 
     def draw_text(
         self,
@@ -1249,6 +1777,7 @@ class RocketGUI:
                     + lx * math.cos(angle)
                     - ly * math.sin(angle)
                 ),
+
                 int(
                     y
                     + lx * math.sin(angle)
@@ -1291,8 +1820,8 @@ class RocketGUI:
             self.screen,
             (230, 240, 250),
             [
-                rotate(p)
-                for p in body
+                rotate(point)
+                for point in body
             ],
         )
 
@@ -1300,8 +1829,8 @@ class RocketGUI:
             self.screen,
             (70, 160, 230),
             [
-                rotate(p)
-                for p in body
+                rotate(point)
+                for point in body
             ],
             2,
         )
@@ -1311,6 +1840,26 @@ class RocketGUI:
             (40, 140, 245),
             rotate((8, 0)),
             4,
+        )
+
+    def draw_path(self):
+
+        if len(self.path) < 2:
+            return
+
+        points = [
+            tuple(
+                np.asarray(p).astype(int)
+            )
+            for p in self.path
+        ]
+
+        pygame.draw.lines(
+            self.screen,
+            (90, 150, 230),
+            False,
+            points,
+            2,
         )
 
     def draw_world(self):
@@ -1325,6 +1874,7 @@ class RocketGUI:
             (0, 0, WORLD_W, WORLD_H),
         )
 
+        # Grid.
         for x in range(0, WORLD_W, 40):
 
             pygame.draw.line(
@@ -1343,14 +1893,28 @@ class RocketGUI:
                 (WORLD_W, y),
             )
 
+        # Warning zone.
         pygame.draw.circle(
             self.screen,
-            (135, 75, 55),
+            (115, 75, 55),
+            tuple(OBSTACLE.astype(int)),
+            int(
+                SAFE_DISTANCE
+                + OBSTACLE_WARNING_DISTANCE
+            ),
+            1,
+        )
+
+        # Safe boundary.
+        pygame.draw.circle(
+            self.screen,
+            (180, 105, 60),
             tuple(OBSTACLE.astype(int)),
             int(SAFE_DISTANCE),
             2,
         )
 
+        # Obstacle.
         pygame.draw.circle(
             self.screen,
             (165, 55, 55),
@@ -1358,6 +1922,7 @@ class RocketGUI:
             int(OBSTACLE_RADIUS),
         )
 
+        # Target.
         tx, ty = self.env.target.astype(int)
 
         pygame.draw.circle(
@@ -1383,6 +1948,8 @@ class RocketGUI:
             (tx, ty + 18),
             2,
         )
+
+        self.draw_path()
 
         self.draw_rocket()
 
@@ -1427,82 +1994,116 @@ class RocketGUI:
         )
 
         self.draw_text(
-            f"Heading: {math.degrees(self.env.heading):.1f} deg",
+            f"Heading: "
+            f"{math.degrees(self.env.heading):.1f} deg",
             720,
             160,
         )
 
         self.draw_text(
-            f"Distance: {distance(self.env.position, self.env.target):.1f}",
+            f"Target distance: "
+            f"{distance(self.env.position, self.env.target):.1f}",
             720,
             190,
         )
 
         self.draw_text(
+            f"Obstacle clearance: "
+            f"{self.env.get_obstacle_clearance():.1f}",
+            720,
+            220,
+        )
+
+        self.draw_text(
             f"Steering: {self.last_action[0]:+.3f}",
             720,
-            235,
+            270,
         )
 
         self.draw_text(
             f"Thrust:   {self.last_action[1]:+.3f}",
             720,
-            265,
+            300,
         )
 
         self.draw_text(
             f"Steps: {self.env.steps}",
             720,
-            310,
+            345,
         )
 
         self.draw_text(
             f"Reward: {self.env.total_reward:.2f}",
             720,
-            340,
+            375,
         )
 
         self.draw_text(
             f"Speed multiplier: {self.speed}",
             720,
-            370,
+            405,
+        )
+
+        if self.env.success:
+
+            status = "SUCCESS"
+
+            color = (80, 255, 130)
+
+        elif self.env.collision:
+
+            status = "COLLISION"
+
+            color = (255, 90, 90)
+
+        else:
+
+            status = "RUNNING"
+
+            color = (220, 220, 220)
+
+        self.draw_text(
+            f"Status: {status}",
+            720,
+            445,
+            color,
         )
 
         self.draw_text(
             "ACTION SPACE",
             720,
-            420,
+            490,
             (120, 210, 255),
         )
 
         self.draw_text(
             "Steering: [-1, +1]",
             720,
-            450,
+            520,
         )
 
         self.draw_text(
             "Thrust:   [-1, +1]",
             720,
-            475,
+            545,
         )
 
         self.draw_text(
             "CLICK: TARGET",
             720,
-            550,
+            580,
         )
 
         self.draw_text(
             "SPACE: PAUSE | R: RESET",
             720,
-            575,
+            605,
         )
 
         self.draw_text(
             "ESC: EXIT | +/-: SPEED",
             720,
-            600,
+            628,
         )
 
     def step(self):
@@ -1520,7 +2121,12 @@ class RocketGUI:
             action
         )
 
+        self.path.append(
+            self.env.position.copy()
+        )
+
         if terminated or truncated:
+
             self.paused = True
 
     def run(self):
@@ -1530,18 +2136,23 @@ class RocketGUI:
             for event in pygame.event.get():
 
                 if event.type == pygame.QUIT:
+
                     self.running = False
 
                 elif event.type == pygame.KEYDOWN:
 
                     if event.key == pygame.K_ESCAPE:
+
                         self.running = False
 
                     elif event.key == pygame.K_SPACE:
+
                         self.paused = not self.paused
 
                     elif event.key == pygame.K_r:
+
                         self.reset()
+
                         self.paused = False
 
                     elif event.key in (
@@ -1549,6 +2160,7 @@ class RocketGUI:
                         pygame.K_EQUALS,
                         pygame.K_KP_PLUS,
                     ):
+
                         self.speed = min(
                             8,
                             self.speed + 1,
@@ -1558,6 +2170,7 @@ class RocketGUI:
                         pygame.K_MINUS,
                         pygame.K_KP_MINUS,
                     ):
+
                         self.speed = max(
                             1,
                             self.speed - 1,
@@ -1577,7 +2190,11 @@ class RocketGUI:
                             if self.env.set_target(
                                 [x, y]
                             ):
+
                                 self.last_action[:] = 0.0
+
+                                self.path.clear()
+
                                 self.paused = False
 
             if not self.paused:
@@ -1590,6 +2207,7 @@ class RocketGUI:
                         break
 
             self.draw_world()
+
             self.draw_panel()
 
             if self.paused:
@@ -1610,7 +2228,7 @@ class RocketGUI:
 
 
 # ============================================================
-# STEP 11 — UNIT TESTS
+# STEP 13 — UNIT TESTS
 # ============================================================
 
 def run_tests():
@@ -1633,30 +2251,31 @@ def run_tests():
             f"[PASS] {name}"
         )
 
-    # Test 1: state dimensions.
     env = ContinuousRocketEnv()
 
+    # 1
     check(
         "State dimension",
         env.get_state().shape == (STATE_SIZE,),
     )
 
-    # Test 2: action dimensions.
+    # 2
     check(
         "Action dimension",
         clamp_action([0.5, -0.5]).shape
         == (ACTION_SIZE,),
     )
 
-    # Test 3: action clipping.
-    action = clamp_action([2.0, -3.0])
-
+    # 3
     check(
         "Action clipping",
-        np.allclose(action, [1.0, -1.0]),
+        np.allclose(
+            clamp_action([2.0, -3.0]),
+            [1.0, -1.0],
+        ),
     )
 
-    # Test 4: actor output range.
+    # 4
     actor = Actor().to(DEVICE)
 
     states = torch.randn(
@@ -1675,13 +2294,13 @@ def run_tests():
         ),
     )
 
-    # Test 5: actor output dimensions.
+    # 5
     check(
         "Actor output dimensions",
         tuple(actions.shape) == (8, ACTION_SIZE),
     )
 
-    # Test 6: critic output dimensions.
+    # 6
     critic = Critic().to(DEVICE)
 
     q = critic(
@@ -1694,7 +2313,7 @@ def run_tests():
         tuple(q.shape) == (8, 1),
     )
 
-    # Test 7: critic differentiates with respect to action.
+    # 7
     test_actions = torch.randn(
         8,
         ACTION_SIZE,
@@ -1715,11 +2334,12 @@ def run_tests():
     check(
         "Critic action gradient exists",
         action_grad.shape == test_actions.shape
-        and torch.isfinite(action_grad).all(),
+        and bool(torch.isfinite(action_grad).all()),
     )
 
-    # Test 8: soft update.
+    # 8
     source = nn.Linear(2, 2)
+
     target = nn.Linear(2, 2)
 
     with torch.no_grad():
@@ -1740,11 +2360,14 @@ def run_tests():
         "Soft update",
         torch.allclose(
             target.weight,
-            torch.full_like(target.weight, 0.1),
+            torch.full_like(
+                target.weight,
+                0.1,
+            ),
         ),
     )
 
-    # Test 9: replay buffer.
+    # 9
     replay = ReplayBuffer(10)
 
     state = np.zeros(
@@ -1770,18 +2393,27 @@ def run_tests():
         len(replay) == 1,
     )
 
-    # Test 10: replay sample shapes.
+    # 10
+    replay_test = ReplayBuffer(
+        max(BATCH_SIZE * 2, 256)
+    )
+
     for _ in range(BATCH_SIZE):
 
-        replay.add(
+        replay_test.add(
             state,
-            np.array([0.1, 0.5], dtype=np.float32),
+            np.array(
+                [0.1, 0.5],
+                dtype=np.float32,
+            ),
             1.0,
             next_state,
             False,
         )
 
-    sample = replay.sample(BATCH_SIZE)
+    sample = replay_test.sample(
+        BATCH_SIZE
+    )
 
     check(
         "Replay batch state dimensions",
@@ -1789,13 +2421,51 @@ def run_tests():
         == (BATCH_SIZE, STATE_SIZE),
     )
 
+    # 11
     check(
         "Replay batch action dimensions",
         tuple(sample[1].shape)
         == (BATCH_SIZE, ACTION_SIZE),
     )
 
-    # Test 11: twin critics.
+    # 12
+    check(
+        "Replay batch reward dimensions",
+        tuple(sample[2].shape)
+        == (BATCH_SIZE, 1),
+    )
+
+    # 13
+    check(
+        "Replay batch next-state dimensions",
+        tuple(sample[3].shape)
+        == (BATCH_SIZE, STATE_SIZE),
+    )
+
+    # 14
+    check(
+        "Replay batch done dimensions",
+        tuple(sample[4].shape)
+        == (BATCH_SIZE, 1),
+    )
+
+    # 15
+    caught_error = False
+
+    try:
+
+        replay.sample(BATCH_SIZE)
+
+    except ValueError:
+
+        caught_error = True
+
+    check(
+        "Replay insufficient-sample validation",
+        caught_error,
+    )
+
+    # 16
     agent = TD3Agent()
 
     with torch.no_grad():
@@ -1811,22 +2481,14 @@ def run_tests():
         )
 
     check(
-        "Twin critics have valid outputs",
+        "Twin critic dimensions",
         q1.shape == q2.shape == (8, 1),
     )
 
-    # Test 12: TD3 target uses smaller Q.
-    test_q1 = torch.tensor(
-        [[5.0], [2.0]],
-    )
-
-    test_q2 = torch.tensor(
-        [[3.0], [4.0]],
-    )
-
+    # 17
     minimum = torch.minimum(
-        test_q1,
-        test_q2,
+        torch.tensor([[5.0], [2.0]]),
+        torch.tensor([[3.0], [4.0]]),
     )
 
     check(
@@ -1837,9 +2499,9 @@ def run_tests():
         ),
     )
 
-    # Test 13: target noise clipping.
+    # 18
     noise = torch.tensor(
-        [[2.0, -2.0]],
+        [[2.0, -2.0]]
     ).clamp(
         -NOISE_CLIP,
         NOISE_CLIP,
@@ -1853,9 +2515,12 @@ def run_tests():
         ),
     )
 
-    # Test 14: environment returns valid tuple.
+    # 19
     result = env.step(
-        np.array([0.0, 0.0], dtype=np.float32)
+        np.array(
+            [0.0, 0.0],
+            dtype=np.float32,
+        )
     )
 
     check(
@@ -1863,40 +2528,96 @@ def run_tests():
         len(result) == 4,
     )
 
-    # Test 15: environment action accepts continuous values.
-    result = env.step(
-        np.array([0.25, 0.5], dtype=np.float32)
+    # 20
+    check(
+        "Environment state remains finite",
+        np.isfinite(result[0]).all(),
+    )
+
+    # 21
+    challenge_env = ContinuousRocketEnv()
+
+    challenge_state = challenge_env.reset(
+        start=[80.0, 280.0],
+        target=[620.0, 280.0],
+        heading=0.0,
     )
 
     check(
-        "Continuous action accepted",
-        len(result[0]) == STATE_SIZE,
+        "Challenge scenario initialization",
+        challenge_state.shape == (STATE_SIZE,),
+    )
+
+    # 22
+    check(
+        "Obstacle clearance is positive initially",
+        challenge_env.get_obstacle_clearance() > 0,
+    )
+
+    # 23
+    check(
+        "Obstacle clearance is finite",
+        np.isfinite(
+            challenge_env.get_obstacle_clearance()
+        ),
+    )
+
+    # 24
+    check(
+        "Success threshold is positive",
+        SUCCESS_DISTANCE > 0,
     )
 
     print(
-        f"\n{passed}/15 tests passed."
+        f"\n{passed}/24 tests passed."
     )
 
 
 # ============================================================
-# STEP 12 — MAIN
+# STEP 14 — MAIN
 # ============================================================
 
 def main():
 
     print("=" * 75)
-    print("PHASE 4.9 — CONTINUOUS CONTROL")
+
+    print(
+        "PHASE 4.9 — IMPROVED CONTINUOUS CONTROL"
+    )
+
     print("=" * 75)
 
-    print("Device:", DEVICE)
+    print(
+        "Device:",
+        DEVICE,
+    )
+
+    print(
+        "State size:",
+        STATE_SIZE,
+    )
+
+    print(
+        "Action size:",
+        ACTION_SIZE,
+    )
+
+    print(
+        "Training episodes:",
+        TRAINING_EPISODES,
+    )
 
     run_tests()
 
     # --------------------------------------------------------
-    # Train DDPG
+    # TRAIN DDPG
     # --------------------------------------------------------
 
-    print("\nTraining DDPG...")
+    print("\n" + "=" * 65)
+
+    print("TRAINING DDPG")
+
+    print("=" * 65)
 
     ddpg_agent = DDPGAgent()
 
@@ -1907,10 +2628,14 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Train TD3
+    # TRAIN TD3
     # --------------------------------------------------------
 
-    print("\nTraining TD3...")
+    print("\n" + "=" * 65)
+
+    print("TRAINING TD3")
+
+    print("=" * 65)
 
     td3_agent = TD3Agent()
 
@@ -1921,7 +2646,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Compare results
+    # TRAINING PLOTS
     # --------------------------------------------------------
 
     plot_training(
@@ -1930,7 +2655,16 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Save models
+    # DETERMINISTIC TD3 EVALUATION
+    # --------------------------------------------------------
+
+    evaluation_results = evaluate_agent(
+        td3_agent,
+        EVALUATION_EPISODES,
+    )
+
+    # --------------------------------------------------------
+    # SAVE MODELS
     # --------------------------------------------------------
 
     torch.save(
@@ -1943,26 +2677,48 @@ def main():
         "td3_actor.pth",
     )
 
-    print("\nSaved:")
+    torch.save(
+        {
+            "actor": td3_agent.actor.state_dict(),
+            "actor_target": td3_agent.actor_target.state_dict(),
+
+            "critic1": td3_agent.critic.state_dict(),
+            "critic2": td3_agent.critic2.state_dict(),
+
+            "critic1_target": td3_agent.critic_target.state_dict(),
+            "critic2_target": td3_agent.critic2_target.state_dict(),
+
+            "state_size": STATE_SIZE,
+            "action_size": ACTION_SIZE,
+        },
+        "td3_full_checkpoint.pth",
+    )
+
+    print("\nSaved models:")
+
     print("  ddpg_actor.pth")
     print("  td3_actor.pth")
+    print("  td3_full_checkpoint.pth")
 
     # --------------------------------------------------------
-    # Visualize trained TD3 rocket.
+    # PYGAME SIMULATION
     # --------------------------------------------------------
 
-    print("\nStarting Pygame TD3 simulation...")
+    print(
+        "\nStarting improved TD3 Pygame simulation..."
+    )
 
     gui_env = ContinuousRocketEnv()
 
     gui = RocketGUI(
         gui_env,
         td3_agent,
-        "TD3",
+        "TD3 — Obstacle Avoidance",
     )
 
     gui.run()
 
 
 if __name__ == "__main__":
+
     main()
