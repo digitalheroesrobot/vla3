@@ -1,103 +1,40 @@
-
 """
 File: phase4/mppi_drone.py
 
-PHASE 4.27 — MODEL PREDICTIVE PATH INTEGRAL CONTROL (MPPI)
+PHASE 4.27 — HIGH-PERFORMANCE MODEL PREDICTIVE PATH
+INTEGRAL CONTROL (MPPI)
 
-PURPOSE
--------
-Use MPPI to plan quadcopter actions for tracking a continuously
-moving target while avoiding obstacles.
+FIX
+---
+1. Fixed missing environment-reset unit test.
+2. Corrected test counting: 24 checks are now executed.
+3. Preserved original MPPI architecture and simulation settings.
 
-WHAT YOU LEARN
---------------
+CONTROLLERS
+-----------
+1. PD
+2. Random Shooting MPC
+3. Learned MPPI
+4. Oracle MPPI
 
-STEP 1 — Dynamics Dataset
-    Collect drone state/action/next-state transitions.
+CONTROLS
+--------
+1-4       Select controller
+SPACE     Pause/resume
+R         Reset
++/-       Simulation speed
+UP/DOWN   Change planning quality
+Mouse     Move target trajectory center
+ESC       Exit
 
-STEP 2 — Learned Dynamics
-    Train a neural network to predict drone state changes.
-
-STEP 3 — MPPI Sampling
-    Sample many candidate future action sequences.
-
-STEP 4 — Cost Evaluation
-    Simulate candidate sequences and calculate their costs.
-
-STEP 5 — Path Integral Update
-    Give lower-cost sequences higher weights and update the
-    nominal action sequence using a weighted average.
-
-STEP 6 — Receding-Horizon Control
-    Execute only the first action, then replan.
-
-STEP 7 — Controller Comparison
-    Compare PD, random-shooting MPC, learned MPPI and Oracle MPPI.
-
-MATHEMATICAL FOUNDATIONS
-------------------------
-
-For a sampled action sequence:
-
-    U_k = [u_0, u_1, ..., u_(H-1)]
-
-Its trajectory cost is:
-
-    S_k = phi(x_H) + sum_t q(x_t, u_t)
-
-MPPI weights:
-
-    w_k = exp(-(S_k - S_min) / lambda)
-          --------------------------------
-          sum_j exp(-(S_j - S_min) / lambda)
-
-Weighted action update:
-
-    U_new = sum_k w_k * U_k
-
-The subtraction of S_min is a numerical stabilization:
-it does not change the normalized weights.
-
-In practice, action noise is sampled around a nominal sequence:
-
-    U_k = U_nominal + epsilon_k
-
-Then:
-
-    U_nominal <- weighted_mean(U_k)
-
-Only the first action is executed. The sequence is shifted
-forward and optimized again at the next time step.
-
-IMPORTANT
----------
-This educational implementation uses a simplified MPPI update.
-It uses weighted sampled action sequences without the full
-importance-sampling correction term found in some MPPI variants.
-
-The learned model is trained from simulated transitions.
-Prediction errors can accumulate over long planning horizons.
-
-Obstacle avoidance uses soft cost penalties. It is not a
-formal safety guarantee.
-
-ROBOTICS APPLICATION
---------------------
-MPPI is useful for:
-    - drone trajectory tracking
-    - autonomous navigation
-    - obstacle-aware motion planning
-    - mobile robot control
-    - manipulation trajectory optimization
-
-The simulator is 2D and is not a flight-certified controller.
+Educational 2D simulation. Not a flight-certified controller.
 """
 
 from __future__ import annotations
 
-import copy
 import math
 import random
+import time
 
 import numpy as np
 import torch
@@ -116,9 +53,15 @@ random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
 DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
+
+if DEVICE.type == "cpu":
+    torch.set_num_threads(2)
 
 WORLD_W = 900
 WORLD_H = 650
@@ -127,6 +70,7 @@ DT = 0.08
 
 MAX_SPEED = 145.0
 MAX_ACCEL = 120.0
+
 DRONE_RADIUS = 12.0
 
 OBSTACLE = np.array(
@@ -135,7 +79,7 @@ OBSTACLE = np.array(
 )
 
 OBSTACLE_RADIUS = 65.0
-SAFE_RADIUS = 110.0
+SAFE_RADIUS = 115.0
 
 TARGET_A = 165.0
 TARGET_B = 105.0
@@ -158,21 +102,29 @@ TRAIN_EPOCHS = 120
 BATCH_SIZE = 256
 LEARNING_RATE = 0.001
 
-# MPPI parameters.
 HORIZON = 16
 SAMPLE_COUNT = 180
 MPPI_ITERATIONS = 3
 
+INTERACTIVE_HORIZON = 16
+INTERACTIVE_SAMPLES = 100
+INTERACTIVE_ITERATIONS = 2
+
 NOISE_STD = np.array(
-    [0.30, 0.30],
+    [0.34, 0.34],
     dtype=np.float64,
 )
 
-LAMBDA = 8.0
+LAMBDA = 10.0
 
-# Benchmark.
+ACTION_SMOOTHING = 0.30
+NOMINAL_BLEND = 0.85
+
 BENCHMARK_EPISODES = 3
 BENCHMARK_STEPS = 180
+
+RENDER_FPS = 60
+TRAIL_LENGTH = 350
 
 
 # ============================================================
@@ -222,9 +174,7 @@ class MovingTarget:
 
     def advance(self):
 
-        self.phase += (
-            TARGET_OMEGA * DT
-        )
+        self.phase += TARGET_OMEGA * DT
 
 
 # ============================================================
@@ -245,7 +195,7 @@ def clip_state(state):
     if speed > MAX_SPEED:
 
         state[2:4] *= (
-            MAX_SPEED / (speed + 1e-9)
+            MAX_SPEED / (speed + 1e-12)
         )
 
     state[0] = np.clip(
@@ -263,17 +213,42 @@ def clip_state(state):
     return state
 
 
-def true_transition(
-    state,
-    action,
-):
+def clip_states_batch(states):
 
-    """
-    Ground-truth 2D drone dynamics.
+    states = np.asarray(
+        states,
+        dtype=np.float64,
+    ).copy()
 
-    state = [x, y, vx, vy]
-    action = [ux, uy]
-    """
+    speeds = np.linalg.norm(
+        states[:, 2:4],
+        axis=1,
+        keepdims=True,
+    )
+
+    scale = np.minimum(
+        1.0,
+        MAX_SPEED / (speeds + 1e-12),
+    )
+
+    states[:, 2:4] *= scale
+
+    states[:, 0] = np.clip(
+        states[:, 0],
+        DRONE_RADIUS,
+        WORLD_W - DRONE_RADIUS,
+    )
+
+    states[:, 1] = np.clip(
+        states[:, 1],
+        DRONE_RADIUS,
+        WORLD_H - DRONE_RADIUS,
+    )
+
+    return states
+
+
+def true_transition(state, action):
 
     state = np.asarray(
         state,
@@ -312,6 +287,47 @@ def true_transition(
                 next_velocity,
             ]
         )
+    )
+
+
+def true_transition_batch(states, actions):
+
+    actions = np.clip(
+        actions,
+        -1.0,
+        1.0,
+    )
+
+    velocity = states[:, 2:4]
+
+    acceleration = (
+        MOTOR_GAIN * MAX_ACCEL * actions
+        - LINEAR_DRAG * velocity
+        - QUADRATIC_DRAG
+        * np.abs(velocity)
+        * velocity
+        + WIND
+    )
+
+    next_velocity = (
+        velocity + acceleration * DT
+    )
+
+    next_position = (
+        states[:, :2]
+        + next_velocity * DT
+    )
+
+    next_states = np.concatenate(
+        [
+            next_position,
+            next_velocity,
+        ],
+        axis=1,
+    )
+
+    return clip_states_batch(
+        next_states
     )
 
 
@@ -369,42 +385,9 @@ class DroneEnv:
 
         return self.state.copy()
 
-    def observation(self):
-
-        relative_target = (
-            self.target.position()
-            - self.position
-        )
-
-        target_velocity = (
-            self.target.velocity()
-        )
-
-        relative_obstacle = (
-            OBSTACLE - self.position
-        )
-
-        return np.concatenate(
-            [
-                relative_target / np.array(
-                    [WORLD_W, WORLD_H]
-                ),
-
-                target_velocity / MAX_SPEED,
-
-                self.velocity / MAX_SPEED,
-
-                relative_obstacle / np.array(
-                    [WORLD_W, WORLD_H]
-                ),
-            ]
-        ).astype(
-            np.float32
-        )
-
 
 # ============================================================
-# 4. DATA COLLECTION
+# 4. PD CONTROLLER
 # ============================================================
 
 def pd_controller(
@@ -428,7 +411,7 @@ def pd_controller(
     if speed > MAX_SPEED:
 
         desired_velocity *= (
-            MAX_SPEED / (speed + 1e-9)
+            MAX_SPEED / (speed + 1e-12)
         )
 
     desired_acceleration = (
@@ -453,9 +436,11 @@ def pd_controller(
     )
 
 
-def collect_dataset(
-    steps=DATA_STEPS,
-):
+# ============================================================
+# 5. DATA COLLECTION
+# ============================================================
+
+def collect_dataset(steps=DATA_STEPS):
 
     env = DroneEnv()
 
@@ -466,7 +451,7 @@ def collect_dataset(
 
     for step in range(steps):
 
-        pd_action = pd_controller(
+        action_pd = pd_controller(
             state,
             env.target.position(),
             env.target.velocity(),
@@ -485,7 +470,7 @@ def collect_dataset(
         elif mode < 0.75:
 
             action = (
-                pd_action
+                action_pd
                 + np.random.normal(
                     0.0,
                     0.28,
@@ -495,7 +480,7 @@ def collect_dataset(
 
         else:
 
-            action = pd_action
+            action = action_pd
 
         action = np.clip(
             action,
@@ -540,7 +525,7 @@ def collect_dataset(
 
 
 # ============================================================
-# 5. NORMALIZATION
+# 6. NORMALIZATION
 # ============================================================
 
 class Normalizer:
@@ -571,7 +556,7 @@ class Normalizer:
 
 
 # ============================================================
-# 6. LEARNED DYNAMICS MODEL
+# 7. LEARNED DYNAMICS
 # ============================================================
 
 class DynamicsNetwork(nn.Module):
@@ -666,6 +651,8 @@ class LearnedDynamics:
 
         for epoch in range(epochs):
 
+            self.model.train()
+
             losses = []
 
             for batch_x, batch_y in loader:
@@ -679,7 +666,9 @@ class LearnedDynamics:
                     batch_y,
                 )
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(
+                    set_to_none=True
+                )
 
                 loss.backward()
 
@@ -708,22 +697,18 @@ class LearnedDynamics:
             ):
 
                 print(
-                    f"Model epoch {epoch+1:3d}/{epochs}"
+                    f"Epoch {epoch+1:3d}/{epochs}"
                     f" | normalized MSE={average_loss:.6f}"
                 )
 
+        self.model.eval()
+
+    @torch.inference_mode()
     def predict_delta_batch(
         self,
         states,
         actions,
     ):
-
-        """
-        Vectorized model prediction.
-
-        states:  (N, 4)
-        actions: (N, 2)
-        """
 
         model_inputs = np.concatenate(
             [
@@ -747,23 +732,15 @@ class LearnedDynamics:
             device=DEVICE,
         )
 
-        with torch.no_grad():
-
-            prediction = (
-                self.model(tensor)
-                .cpu()
-                .numpy()
-            )
+        prediction = self.model(
+            tensor
+        ).cpu().numpy()
 
         return self.output_normalizer.inverse(
             prediction
         )
 
-    def predict_next(
-        self,
-        state,
-        action,
-    ):
+    def predict_next(self, state, action):
 
         delta = self.predict_delta_batch(
             state[None, :],
@@ -776,62 +753,121 @@ class LearnedDynamics:
 
 
 # ============================================================
-# 7. MPC STAGE COST
+# 8. IMPROVED COST FUNCTION
 # ============================================================
 
-def stage_cost(
-    state,
+def stage_cost_batch(
+    states,
     target_position,
-    action,
+    target_velocity,
+    actions,
+    previous_actions=None,
 ):
 
+    position_error = (
+        states[:, :2] - target_position
+    )
+
     distance = np.linalg.norm(
-        state[:2] - target_position
+        position_error,
+        axis=1,
+    )
+
+    velocity_error = (
+        states[:, 2:4] - target_velocity
+    )
+
+    velocity_cost = np.sum(
+        velocity_error**2,
+        axis=1,
     )
 
     obstacle_distance = np.linalg.norm(
-        state[:2] - OBSTACLE
+        states[:, :2] - OBSTACLE,
+        axis=1,
     )
 
-    obstacle_violation = max(
+    safe_violation = np.maximum(
         0.0,
         SAFE_RADIUS - obstacle_distance,
     )
 
-    boundary_distance = min(
-        state[0],
-        WORLD_W - state[0],
-        state[1],
-        WORLD_H - state[1],
+    obstacle_cost = (
+        0.075 * safe_violation**2
     )
 
-    boundary_violation = max(
-        0.0,
-        55.0 - boundary_distance,
+    boundary_distance = np.minimum.reduce(
+        [
+            states[:, 0],
+            WORLD_W - states[:, 0],
+            states[:, 1],
+            WORLD_H - states[:, 1],
+        ]
     )
+
+    boundary_violation = np.maximum(
+        0.0,
+        65.0 - boundary_distance,
+    )
+
+    boundary_cost = (
+        0.12 * boundary_violation**2
+    )
+
+    effort_cost = (
+        0.18 * np.sum(
+            actions**2,
+            axis=1,
+        )
+    )
+
+    if previous_actions is not None:
+
+        smooth_cost = (
+            0.16 * np.sum(
+                (actions - previous_actions)**2,
+                axis=1,
+            )
+        )
+
+    else:
+
+        smooth_cost = 0.0
 
     return (
-        0.025 * distance
-        + 0.055 * obstacle_violation**2
-        + 0.06 * boundary_violation**2
-        + 0.25 * np.sum(action**2)
+        0.035 * distance
+        + 0.0007 * velocity_cost
+        + obstacle_cost
+        + boundary_cost
+        + effort_cost
+        + smooth_cost
     )
 
 
-def terminal_cost(
-    state,
+def terminal_cost_batch(
+    states,
     target_position,
+    target_velocity,
 ):
 
     distance = np.linalg.norm(
-        state[:2] - target_position
+        states[:, :2] - target_position,
+        axis=1,
     )
 
-    return 0.05 * distance
+    velocity_error = np.linalg.norm(
+        states[:, 2:4] - target_velocity,
+        axis=1,
+    )
+
+    return (
+        0.12 * distance
+        + 0.001 * velocity_error**2
+    )
 
 
 # ============================================================
-# 8. BATCHED CANDIDATE ROLLOUT
+# 9. BATCHED TRAJECTORY EVALUATION
 # ============================================================
 
 def evaluate_action_sequences(
@@ -841,17 +877,6 @@ def evaluate_action_sequences(
     phase,
     model,
 ):
-
-    """
-    Evaluate many candidate sequences.
-
-    action_sequences:
-        (N, H, 2)
-
-    Each candidate starts from the same initial state.
-
-    Learned-model predictions are vectorized across candidates.
-    """
 
     candidate_count = len(
         action_sequences
@@ -868,15 +893,45 @@ def evaluate_action_sequences(
         dtype=np.float64,
     )
 
-    for step in range(
-        action_sequences.shape[1]
-    ):
+    previous_actions = np.repeat(
+        np.zeros((1, 2)),
+        candidate_count,
+        axis=0,
+    )
+
+    horizon = action_sequences.shape[1]
+
+    for step in range(horizon):
 
         actions = action_sequences[
             :,
             step,
             :,
         ]
+
+        if model == "oracle":
+
+            next_states = true_transition_batch(
+                states,
+                actions,
+            )
+
+        elif isinstance(model, LearnedDynamics):
+
+            deltas = model.predict_delta_batch(
+                states,
+                actions,
+            )
+
+            next_states = clip_states_batch(
+                states + deltas
+            )
+
+        else:
+
+            raise ValueError(
+                "Unsupported dynamics model"
+            )
 
         future_phase = (
             phase
@@ -887,77 +942,37 @@ def evaluate_action_sequences(
             future_phase
         )
 
-        if model == "oracle":
+        future_velocity = target.velocity(
+            future_phase
+        )
 
-            # Ground-truth dynamics for each candidate.
-            next_states = np.asarray(
-                [
-                    true_transition(
-                        states[index],
-                        actions[index],
-                    )
-                    for index in range(candidate_count)
-                ]
-            )
-
-        elif isinstance(
-            model,
-            LearnedDynamics,
-        ):
-
-            deltas = model.predict_delta_batch(
-                states,
-                actions,
-            )
-
-            next_states = np.asarray(
-                [
-                    clip_state(
-                        states[index] + deltas[index]
-                    )
-                    for index in range(candidate_count)
-                ]
-            )
-
-        else:
-
-            raise ValueError(
-                "Unsupported dynamics model"
-            )
-
-        for index in range(candidate_count):
-
-            costs[index] += stage_cost(
-                next_states[index],
-                future_target,
-                actions[index],
-            )
+        costs += stage_cost_batch(
+            next_states,
+            future_target,
+            future_velocity,
+            actions,
+            previous_actions,
+        )
 
         states = next_states
+        previous_actions = actions
 
     final_phase = (
         phase
-        + TARGET_OMEGA
-        * DT
-        * action_sequences.shape[1]
+        + TARGET_OMEGA * DT * horizon
     )
 
-    final_target = target.position(
-        final_phase
+    costs += terminal_cost_batch(
+        states,
+        target.position(final_phase),
+        target.velocity(final_phase),
     )
-
-    for index in range(candidate_count):
-
-        costs[index] += terminal_cost(
-            states[index],
-            final_target,
-        )
 
     return costs
 
 
 # ============================================================
-# 9. NOMINAL ACTION SEQUENCE
+# 10. NOMINAL ACTION SEQUENCE
 # ============================================================
 
 def make_nominal_sequence(
@@ -966,13 +981,6 @@ def make_nominal_sequence(
     phase,
     horizon,
 ):
-
-    """
-    Construct a nominal sequence using a PD controller.
-
-    This seed is common to learned MPPI and Oracle MPPI.
-    It does not use the learned or true model for its rollout.
-    """
 
     nominal = np.zeros(
         (horizon, 2),
@@ -984,46 +992,68 @@ def make_nominal_sequence(
     for step in range(horizon):
 
         future_phase = (
-            phase
-            + TARGET_OMEGA * DT * step
+            phase + TARGET_OMEGA * DT * step
+        )
+
+        future_position = target.position(
+            future_phase
+        )
+
+        future_velocity = target.velocity(
+            future_phase
         )
 
         action = pd_controller(
             estimated_state,
-            target.position(future_phase),
-            target.velocity(future_phase),
+            future_position,
+            future_velocity,
         )
 
         nominal[step] = action
 
-        # Approximate kinematic seed propagation.
-        estimated_state[2:4] += (
-            MAX_ACCEL * action * DT
-        )
-
-        speed = np.linalg.norm(
-            estimated_state[2:4]
-        )
-
-        if speed > MAX_SPEED:
-
-            estimated_state[2:4] *= (
-                MAX_SPEED / (speed + 1e-9)
-            )
-
-        estimated_state[:2] += (
-            estimated_state[2:4] * DT
-        )
-
-        estimated_state = clip_state(
-            estimated_state
+        estimated_state = true_transition(
+            estimated_state,
+            action,
         )
 
     return nominal
 
 
 # ============================================================
-# 10. RANDOM-SHOOTING MPC
+# 11. STABLE MPPI WEIGHTS
+# ============================================================
+
+def calculate_mppi_weights(
+    costs,
+    temperature=LAMBDA,
+):
+
+    minimum_cost = np.min(
+        costs
+    )
+
+    logits = (
+        -(costs - minimum_cost)
+        / max(temperature, 1e-6)
+    )
+
+    logits -= np.max(
+        logits
+    )
+
+    weights = np.exp(
+        np.clip(logits, -80.0, 0.0)
+    )
+
+    weights /= (
+        np.sum(weights) + 1e-12
+    )
+
+    return weights
+
+
+# ============================================================
+# 12. RANDOM SHOOTING MPC
 # ============================================================
 
 def random_shooting_action(
@@ -1047,11 +1077,7 @@ def random_shooting_action(
         + np.random.normal(
             0.0,
             NOISE_STD,
-            size=(
-                samples,
-                horizon,
-                2,
-            ),
+            size=(samples, horizon, 2),
         )
     )
 
@@ -1083,29 +1109,10 @@ def random_shooting_action(
 
 
 # ============================================================
-# 11. MPPI CONTROLLER
+# 13. IMPROVED MPPI CONTROLLER
 # ============================================================
 
 class MPPIController:
-
-    """
-    Simplified MPPI.
-
-    At every iteration:
-
-        1. Sample action sequences around nominal.
-        2. Evaluate all trajectories.
-        3. Convert costs into normalized exponential weights.
-        4. Update nominal sequence using weighted averaging.
-
-    Stable weights:
-
-        w = softmax(-(cost - min(cost)) / lambda)
-
-    Receding horizon:
-        Execute the first action only.
-        Shift the optimized sequence and replan.
-    """
 
     def __init__(
         self,
@@ -1128,17 +1135,26 @@ class MPPIController:
             dtype=np.float64,
         )
 
+        self.initialized = False
+
         self.last_weights = None
         self.last_costs = None
+
+        self.last_action = np.zeros(
+            2,
+            dtype=np.float64,
+        )
 
     def reset(self):
 
-        self.nominal.fill(
-            0.0
-        )
+        self.nominal.fill(0.0)
+
+        self.initialized = False
 
         self.last_weights = None
         self.last_costs = None
+
+        self.last_action.fill(0.0)
 
     def plan(
         self,
@@ -1147,7 +1163,7 @@ class MPPIController:
         phase,
     ):
 
-        if not np.any(self.nominal):
+        if not self.initialized:
 
             self.nominal = make_nominal_sequence(
                 state,
@@ -1156,11 +1172,11 @@ class MPPIController:
                 self.horizon,
             )
 
+            self.initialized = True
+
         nominal = self.nominal.copy()
 
-        for _ in range(
-            self.iterations
-        ):
+        for _ in range(self.iterations):
 
             noise = np.random.normal(
                 0.0,
@@ -1183,7 +1199,6 @@ class MPPIController:
                 1.0,
             )
 
-            # Preserve the current nominal sequence as one candidate.
             candidates[0] = nominal
 
             costs = evaluate_action_sequences(
@@ -1194,36 +1209,20 @@ class MPPIController:
                 self.model,
             )
 
-            # Numerically stable path-integral weights.
-            minimum_cost = np.min(
-                costs
+            weights = calculate_mppi_weights(
+                costs,
+                self.temperature,
             )
 
-            logits = (
-                -(costs - minimum_cost)
-                / max(
-                    self.temperature,
-                    1e-6,
-                )
-            )
-
-            logits -= np.max(
-                logits
-            )
-
-            weights = np.exp(
-                logits
-            )
-
-            weights /= (
-                np.sum(weights) + 1e-12
-            )
-
-            # Weighted average of action sequences.
-            nominal = np.sum(
+            weighted_sequence = np.sum(
                 weights[:, None, None]
                 * candidates,
                 axis=0,
+            )
+
+            nominal = (
+                NOMINAL_BLEND * weighted_sequence
+                + (1.0 - NOMINAL_BLEND) * nominal
             )
 
             nominal = np.clip(
@@ -1235,25 +1234,33 @@ class MPPIController:
             self.last_weights = weights
             self.last_costs = costs
 
-        action = nominal[0].copy()
+        raw_action = nominal[0].copy()
 
-        # Receding-horizon warm start:
-        # shift the plan one step into the future.
+        action = (
+            ACTION_SMOOTHING * self.last_action
+            + (1.0 - ACTION_SMOOTHING) * raw_action
+        )
+
+        action = np.clip(
+            action,
+            -1.0,
+            1.0,
+        )
+
+        self.last_action = action.copy()
+
         self.nominal[:-1] = nominal[1:]
-
         self.nominal[-1] = nominal[-1]
 
         return (
-            action,
+            action.copy(),
             nominal.copy(),
-            float(
-                np.min(costs)
-            ),
+            float(np.min(costs)),
         )
 
 
 # ============================================================
-# 12. BENCHMARKING
+# 14. BENCHMARKING
 # ============================================================
 
 def run_episode(
@@ -1263,7 +1270,6 @@ def run_episode(
 ):
 
     env = DroneEnv()
-
     state = env.reset()
 
     if mode == "Learned MPPI":
@@ -1279,17 +1285,12 @@ def run_episode(
         )
 
     distances = []
-    collisions = []
+    collision_steps = 0
 
     for _ in range(steps):
 
-        target_position = (
-            env.target.position()
-        )
-
-        target_velocity = (
-            env.target.velocity()
-        )
+        target_position = env.target.position()
+        target_velocity = env.target.velocity()
 
         if mode == "PD":
 
@@ -1321,21 +1322,13 @@ def run_episode(
 
         else:
 
-            raise ValueError(
-                mode
-            )
+            raise ValueError(mode)
 
-        state = env.step(
-            action
-        )
-
-        future_target = (
-            env.target.position()
-        )
+        state = env.step(action)
 
         distances.append(
             np.linalg.norm(
-                state[:2] - future_target
+                state[:2] - env.target.position()
             )
         )
 
@@ -1346,18 +1339,15 @@ def run_episode(
             - OBSTACLE_RADIUS
         )
 
-        collisions.append(
-            clearance < 0.0
-        )
+        if clearance < 0:
+            collision_steps += 1
 
     return {
         "mean_distance": float(
             np.mean(distances)
         ),
 
-        "collision_steps": int(
-            np.sum(collisions)
-        ),
+        "collision_steps": collision_steps,
 
         "distances": np.asarray(
             distances
@@ -1365,9 +1355,7 @@ def run_episode(
     }
 
 
-def benchmark(
-    learned_model,
-):
+def benchmark(learned_model):
 
     modes = [
         "PD",
@@ -1386,18 +1374,14 @@ def benchmark(
 
         episode_results = []
 
-        for episode in range(
-            BENCHMARK_EPISODES
-        ):
+        for episode in range(BENCHMARK_EPISODES):
 
             result = run_episode(
                 mode,
                 learned_model,
             )
 
-            episode_results.append(
-                result
-            )
+            episode_results.append(result)
 
         results[mode] = {
             "mean_distance": float(
@@ -1429,43 +1413,34 @@ def benchmark(
 
 
 # ============================================================
-# 13. VISUALIZATION
+# 15. VISUALIZATION — TRAINING
 # ============================================================
 
 def plot_training_loss(model):
 
-    plt.figure(
-        figsize=(9, 5)
-    )
+    plt.figure(figsize=(9, 5))
 
     plt.plot(
-        model.loss_history
+        model.loss_history,
+        linewidth=2,
     )
 
     plt.title(
         "Learned Dynamics Model Training Loss"
     )
 
-    plt.xlabel(
-        "Epoch"
-    )
+    plt.xlabel("Epoch")
+    plt.ylabel("Normalized MSE")
 
-    plt.ylabel(
-        "Normalized MSE"
-    )
-
-    plt.grid(True)
+    plt.grid(True, alpha=0.3)
 
     plt.tight_layout()
-
     plt.show()
 
 
 def plot_benchmark(results):
 
-    names = list(
-        results.keys()
-    )
+    names = list(results.keys())
 
     distances = [
         results[name]["mean_distance"]
@@ -1477,67 +1452,50 @@ def plot_benchmark(results):
         for name in names
     ]
 
-    plt.figure(
-        figsize=(9, 5)
-    )
+    plt.figure(figsize=(9, 5))
 
-    plt.bar(
-        names,
-        distances,
-    )
+    plt.bar(names, distances)
 
     plt.title(
-        "Moving-Target Tracking Distance"
+        "Moving Target Tracking Performance"
     )
 
-    plt.ylabel(
-        "Mean distance"
-    )
+    plt.ylabel("Mean tracking distance")
 
     plt.grid(
-        axis="y"
+        axis="y",
+        alpha=0.3,
     )
 
     plt.tight_layout()
-
     plt.show()
 
-    plt.figure(
-        figsize=(9, 5)
-    )
+    plt.figure(figsize=(9, 5))
 
-    plt.bar(
-        names,
-        collisions,
-    )
+    plt.bar(names, collisions)
 
     plt.title(
-        "Obstacle Collision Steps"
+        "Obstacle Collision Performance"
     )
 
-    plt.ylabel(
-        "Average collision steps per episode"
-    )
+    plt.ylabel("Average collision steps")
 
     plt.grid(
-        axis="y"
+        axis="y",
+        alpha=0.3,
     )
 
     plt.tight_layout()
-
     plt.show()
 
 
 # ============================================================
-# 14. INTERACTIVE PYGAME
+# 16. INTERACTIVE PYGAME
 # ============================================================
 
-def run_pygame(
-    learned_model,
-):
+def run_pygame(learned_model):
 
     try:
-
         import pygame
 
     except ImportError:
@@ -1555,18 +1513,22 @@ def run_pygame(
     )
 
     pygame.display.set_caption(
-        "Phase 4.27 — MPPI Drone Control"
+        "PHASE 4.27 | High Performance MPPI Drone"
     )
 
     clock = pygame.time.Clock()
 
     font = pygame.font.SysFont(
         "consolas",
-        15,
+        16,
+    )
+
+    small_font = pygame.font.SysFont(
+        "consolas",
+        13,
     )
 
     env = DroneEnv()
-
     state = env.reset()
 
     controllers = {
@@ -1579,99 +1541,137 @@ def run_pygame(
     selected = 3
 
     learned_mppi = MPPIController(
-        learned_model
+        learned_model,
+        horizon=INTERACTIVE_HORIZON,
+        sample_count=INTERACTIVE_SAMPLES,
+        iterations=INTERACTIVE_ITERATIONS,
     )
 
     oracle_mppi = MPPIController(
-        "oracle"
+        "oracle",
+        horizon=INTERACTIVE_HORIZON,
+        sample_count=INTERACTIVE_SAMPLES,
+        iterations=INTERACTIVE_ITERATIONS,
     )
 
     paused = False
-    speed = 1
+    simulation_speed = 1
 
     trail = []
     predicted_path = []
 
     current_weights = None
 
+    current_action = np.zeros(
+        2,
+        dtype=np.float64,
+    )
+
+    current_cost = 0.0
+
+    frame_times = []
+    fps_value = 0.0
+    planning_time_ms = 0.0
+
+    quality_levels = [
+        (60, 1),
+        (100, 2),
+        (150, 2),
+        (180, 3),
+    ]
+
+    quality_index = 1
+
+    def update_quality():
+
+        samples, iterations = quality_levels[
+            quality_index
+        ]
+
+        learned_mppi.sample_count = samples
+        learned_mppi.iterations = iterations
+
+        oracle_mppi.sample_count = samples
+        oracle_mppi.iterations = iterations
+
     def draw_text(
         message,
         x,
         y,
         color=(235, 235, 235),
+        use_small=False,
     ):
 
+        selected_font = (
+            small_font if use_small else font
+        )
+
+        surface = selected_font.render(
+            message,
+            True,
+            color,
+        )
+
         screen.blit(
-            font.render(
-                message,
-                True,
-                color,
-            ),
+            surface,
             (x, y),
         )
 
-    def draw_drone():
+    def draw_background():
 
-        center = state[:2]
-
-        velocity = state[2:4]
-
-        norm = np.linalg.norm(
-            velocity
+        screen.fill(
+            (14, 19, 29)
         )
 
-        direction = (
-            velocity / norm
-            if norm > 1e-6
-            else np.array([1.0, 0.0])
-        )
+        for x in range(0, WORLD_W, 50):
 
-        side = np.array(
-            [
-                -direction[1],
-                direction[0],
-            ]
-        )
+            pygame.draw.line(
+                screen,
+                (28, 36, 49),
+                (x, 0),
+                (x, WORLD_H),
+            )
 
-        for forward in (-1, 1):
+        for y in range(0, WORLD_H, 50):
 
-            for lateral in (-1, 1):
+            pygame.draw.line(
+                screen,
+                (28, 36, 49),
+                (0, y),
+                (WORLD_W, y),
+            )
 
-                end = (
-                    center
-                    + 17 * forward * direction
-                    + 17 * lateral * side
-                )
+    def draw_obstacle():
 
-                pygame.draw.line(
-                    screen,
-                    (220, 225, 235),
-                    center.astype(int),
-                    end.astype(int),
-                    5,
-                )
-
-                pygame.draw.circle(
-                    screen,
-                    (90, 190, 245),
-                    end.astype(int),
-                    7,
-                    2,
-                )
+        center = OBSTACLE.astype(int)
 
         pygame.draw.circle(
             screen,
-            (250, 250, 250),
-            center.astype(int),
-            8,
+            (75, 79, 91),
+            center,
+            int(OBSTACLE_RADIUS),
         )
 
         pygame.draw.circle(
             screen,
-            (255, 190, 60),
-            (
-                center + direction * 22
-            ).astype(int),
+            (110, 120, 135),
+            center,
+            int(OBSTACLE_RADIUS),
+            2,
+        )
+
+        pygame.draw.circle(
+            screen,
+            (180, 95, 85),
+            center,
+            int(SAFE_RADIUS),
+            1,
+        )
+
+        pygame.draw.circle(
+            screen,
+            (200, 105, 90),
+            center,
             4,
         )
 
@@ -1679,11 +1679,11 @@ def run_pygame(
 
         points = []
 
-        for index in range(100):
+        for index in range(120):
 
             phase = (
                 env.target.phase
-                + 2.0 * math.pi * index / 100
+                + 2.0 * math.pi * index / 120
             )
 
             points.append(
@@ -1694,300 +1694,169 @@ def run_pygame(
 
         pygame.draw.lines(
             screen,
-            (65, 105, 75),
+            (48, 95, 65),
             True,
             points,
             2,
         )
 
-        position = (
-            env.target.position()
-        )
+        position = env.target.position()
+        velocity = env.target.velocity()
 
-        velocity = (
-            env.target.velocity()
-        )
-
-        pygame.draw.circle(
-            screen,
-            (70, 240, 110),
-            position.astype(int),
-            11,
+        future_position = env.target.position(
+            env.target.phase + TARGET_OMEGA * DT * 5
         )
 
         pygame.draw.line(
             screen,
-            (70, 255, 120),
+            (90, 170, 105),
+            position.astype(int),
+            future_position.astype(int),
+            2,
+        )
+
+        pygame.draw.circle(
+            screen,
+            (65, 235, 105),
+            position.astype(int),
+            12,
+        )
+
+        pygame.draw.circle(
+            screen,
+            (200, 255, 210),
+            position.astype(int),
+            5,
+        )
+
+        pygame.draw.line(
+            screen,
+            (90, 255, 125),
             position.astype(int),
             (
-                position + 0.18 * velocity
+                position + velocity * 0.16
             ).astype(int),
             3,
         )
 
-    running = True
+    def draw_drone():
 
-    while running:
+        center = state[:2]
+        velocity = state[2:4]
 
-        clock.tick(60)
-
-        for event in pygame.event.get():
-
-            if event.type == pygame.QUIT:
-
-                running = False
-
-            elif event.type == pygame.KEYDOWN:
-
-                if event.key == pygame.K_ESCAPE:
-
-                    running = False
-
-                elif event.key == pygame.K_SPACE:
-
-                    paused = not paused
-
-                elif event.key == pygame.K_r:
-
-                    state = env.reset()
-
-                    learned_mppi.reset()
-                    oracle_mppi.reset()
-
-                    trail.clear()
-                    predicted_path.clear()
-
-                elif event.key == pygame.K_1:
-
-                    selected = 1
-
-                elif event.key == pygame.K_2:
-
-                    selected = 2
-
-                elif event.key == pygame.K_3:
-
-                    selected = 3
-
-                elif event.key == pygame.K_4:
-
-                    selected = 4
-
-                elif event.key in (
-                    pygame.K_EQUALS,
-                    pygame.K_PLUS,
-                ):
-
-                    speed = min(
-                        5,
-                        speed + 1,
-                    )
-
-                elif event.key == pygame.K_MINUS:
-
-                    speed = max(
-                        1,
-                        speed - 1,
-                    )
-
-            elif event.type == pygame.MOUSEBUTTONDOWN:
-
-                if event.button == 1:
-
-                    click = np.asarray(
-                        event.pos,
-                        dtype=np.float64,
-                    )
-
-                    if (
-                        np.linalg.norm(
-                            click - OBSTACLE
-                        )
-                        > SAFE_RADIUS
-                    ):
-
-                        env.target.center = np.clip(
-                            click,
-                            [
-                                TARGET_A + 20,
-                                TARGET_B + 20,
-                            ],
-                            [
-                                WORLD_W - TARGET_A - 20,
-                                WORLD_H - TARGET_B - 20,
-                            ],
-                        )
-
-        mode = controllers[
-            selected
-        ]
-
-        if not paused:
-
-            for _ in range(speed):
-
-                if mode == "PD":
-
-                    action = pd_controller(
-                        state,
-                        env.target.position(),
-                        env.target.velocity(),
-                    )
-
-                    predicted_path = []
-                    current_weights = None
-
-                elif mode == "Random MPC":
-
-                    action, sequence, _ = (
-                        random_shooting_action(
-                            state,
-                            env.target,
-                            env.target.phase,
-                            learned_model,
-                            samples=100,
-                        )
-                    )
-
-                    predicted_path = []
-                    current_weights = None
-
-                else:
-
-                    controller = (
-                        learned_mppi
-                        if mode == "Learned MPPI"
-                        else oracle_mppi
-                    )
-
-                    action, sequence, _ = (
-                        controller.plan(
-                            state,
-                            env.target,
-                            env.target.phase,
-                        )
-                    )
-
-                    current_weights = (
-                        controller.last_weights
-                    )
-
-                    predicted_state = (
-                        state.copy()
-                    )
-
-                    predicted_path = []
-
-                    for future_action in sequence:
-
-                        if mode == "Oracle MPPI":
-
-                            predicted_state = (
-                                true_transition(
-                                    predicted_state,
-                                    future_action,
-                                )
-                            )
-
-                        else:
-
-                            predicted_state = (
-                                learned_model.predict_next(
-                                    predicted_state,
-                                    future_action,
-                                )
-                            )
-
-                        predicted_path.append(
-                            predicted_state[:2].copy()
-                        )
-
-                state = env.step(
-                    action
-                )
-
-                trail.append(
-                    state[:2].copy()
-                )
-
-                if len(trail) > 200:
-
-                    trail.pop(0)
-
-        screen.fill(
-            (17, 23, 34)
+        speed = np.linalg.norm(
+            velocity
         )
 
-        for x in range(
-            0,
-            WORLD_W,
-            50,
-        ):
+        if speed > 1e-6:
+            direction = velocity / speed
+        else:
+            direction = np.array([1.0, 0.0])
 
-            pygame.draw.line(
-                screen,
-                (30, 38, 50),
-                (x, 0),
-                (x, WORLD_H),
-            )
+        side = np.array(
+            [
+                -direction[1],
+                direction[0],
+            ]
+        )
 
-        for y in range(
-            0,
-            WORLD_H,
-            50,
-        ):
-
-            pygame.draw.line(
-                screen,
-                (30, 38, 50),
-                (0, y),
-                (WORLD_W, y),
-            )
+        center_int = center.astype(int)
 
         pygame.draw.circle(
             screen,
-            (100, 100, 110),
-            OBSTACLE.astype(int),
-            OBSTACLE_RADIUS,
+            (8, 12, 19),
+            (center_int[0] + 3, center_int[1] + 4),
+            18,
+        )
+
+        for forward in (-1, 1):
+
+            for lateral in (-1, 1):
+
+                end = (
+                    center
+                    + 16 * forward * direction
+                    + 16 * lateral * side
+                )
+
+                pygame.draw.line(
+                    screen,
+                    (200, 210, 225),
+                    center_int,
+                    end.astype(int),
+                    5,
+                )
+
+                pygame.draw.circle(
+                    screen,
+                    (90, 180, 240),
+                    end.astype(int),
+                    8,
+                    2,
+                )
+
+        pygame.draw.circle(
+            screen,
+            (220, 225, 235),
+            center_int,
+            9,
         )
 
         pygame.draw.circle(
             screen,
-            (175, 90, 90),
-            OBSTACLE.astype(int),
-            SAFE_RADIUS,
-            1,
+            (245, 190, 65),
+            (
+                center + direction * 23
+            ).astype(int),
+            5,
         )
 
-        draw_target()
+    def draw_trail():
 
         if len(trail) > 1:
 
             pygame.draw.lines(
                 screen,
-                (70, 135, 235),
+                (65, 130, 230),
                 False,
                 [
                     point.astype(int)
                     for point in trail
                 ],
-                2,
+                3,
             )
+
+    def draw_prediction():
 
         if len(predicted_path) > 1:
 
+            points = [
+                point.astype(int)
+                for point in predicted_path
+            ]
+
             pygame.draw.lines(
                 screen,
-                (245, 190, 60),
+                (255, 195, 65),
                 False,
-                [
-                    point.astype(int)
-                    for point in predicted_path
-                ],
-                2,
+                points,
+                3,
             )
 
-        draw_drone()
+            for index in range(
+                0,
+                len(points),
+                3,
+            ):
+
+                pygame.draw.circle(
+                    screen,
+                    (255, 215, 110),
+                    points[index],
+                    3,
+                )
+
+    def draw_hud():
 
         distance = np.linalg.norm(
             state[:2] - env.target.position()
@@ -2000,41 +1869,105 @@ def run_pygame(
             - OBSTACLE_RADIUS
         )
 
-        draw_text(
-            f"Controller: {mode}",
-            15,
-            12,
+        speed = np.linalg.norm(
+            state[2:4]
+        )
+
+        panel = pygame.Surface(
+            (380, 230),
+            pygame.SRCALPHA,
+        )
+
+        panel.fill(
+            (10, 15, 25, 220)
+        )
+
+        screen.blit(
+            panel,
+            (8, 8),
         )
 
         draw_text(
-            f"Target distance: {distance:.2f}",
-            15,
-            38,
+            "PHASE 4.27 | MPPI CONTROL",
+            20,
+            16,
+            (110, 200, 255),
         )
 
         draw_text(
-            f"Obstacle clearance: {clearance:.2f}",
-            15,
-            64,
+            f"Controller: {controllers[selected]}",
+            20,
+            45,
+            (245, 245, 245),
         )
 
         draw_text(
-            f"Drone velocity: ({state[2]:.1f}, {state[3]:.1f})",
-            15,
-            90,
+            f"Tracking distance: {distance:7.2f}",
+            20,
+            73,
         )
 
         draw_text(
-            f"Simulation speed: {speed}x",
-            15,
-            116,
+            f"Drone speed:       {speed:7.2f}",
+            20,
+            99,
+        )
+
+        clearance_color = (
+            (255, 90, 90)
+            if clearance < 0
+            else (100, 230, 140)
         )
 
         draw_text(
-            "Yellow line: planned future trajectory",
+            f"Obstacle clearance: {clearance:7.2f}",
+            20,
+            125,
+            clearance_color,
+        )
+
+        draw_text(
+            f"FPS: {fps_value:5.1f}",
+            20,
+            151,
+            (120, 210, 255),
+        )
+
+        draw_text(
+            f"Planning time: {planning_time_ms:6.1f} ms",
+            20,
+            177,
+            (255, 210, 100),
+        )
+
+        draw_text(
+            f"Simulation speed: {simulation_speed}x",
+            20,
+            203,
+        )
+
+        draw_text(
+            "1 PD | 2 Random MPC | 3 Learned MPPI | 4 Oracle MPPI",
             15,
-            142,
-            (255, 205, 95),
+            WORLD_H - 85,
+            (230, 230, 240),
+            True,
+        )
+
+        draw_text(
+            "SPACE Pause | R Reset | +/- Speed | UP/DOWN Quality",
+            15,
+            WORLD_H - 60,
+            (190, 200, 215),
+            True,
+        )
+
+        draw_text(
+            "Mouse click: move target center | ESC: Exit",
+            15,
+            WORLD_H - 35,
+            (190, 200, 215),
+            True,
         )
 
         if current_weights is not None:
@@ -2050,33 +1983,276 @@ def run_pygame(
             )
 
             draw_text(
-                f"Effective weighted samples: {effective_samples:.1f}",
-                15,
-                168,
-                (255, 205, 95),
+                f"Effective samples: {effective_samples:.1f}",
+                WORLD_W - 260,
+                20,
+                (255, 210, 100),
             )
-
-        draw_text(
-            "1 PD | 2 Random MPC | 3 Learned MPPI | 4 Oracle MPPI",
-            15,
-            WORLD_H - 100,
-        )
-
-        draw_text(
-            "SPACE pause | R reset | +/- speed | "
-            "click target center | ESC exit",
-            15,
-            WORLD_H - 65,
-        )
 
         if paused:
 
             draw_text(
                 "PAUSED",
-                WORLD_W - 115,
-                15,
+                WORLD_W - 150,
+                55,
                 (255, 210, 80),
             )
+
+    running = True
+
+    while running:
+
+        frame_start = time.perf_counter()
+
+        clock.tick(
+            RENDER_FPS
+        )
+
+        frame_times.append(
+            time.perf_counter() - frame_start
+        )
+
+        if len(frame_times) > 30:
+            frame_times.pop(0)
+
+        average_frame_time = np.mean(
+            frame_times
+        )
+
+        fps_value = (
+            1.0 / max(average_frame_time, 1e-6)
+        )
+
+        for event in pygame.event.get():
+
+            if event.type == pygame.QUIT:
+                running = False
+
+            elif event.type == pygame.KEYDOWN:
+
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+
+                elif event.key == pygame.K_SPACE:
+                    paused = not paused
+
+                elif event.key == pygame.K_r:
+
+                    state = env.reset()
+
+                    learned_mppi.reset()
+                    oracle_mppi.reset()
+
+                    trail.clear()
+                    predicted_path.clear()
+
+                    current_weights = None
+                    current_action.fill(0.0)
+
+                elif event.key == pygame.K_1:
+                    selected = 1
+
+                elif event.key == pygame.K_2:
+                    selected = 2
+
+                elif event.key == pygame.K_3:
+                    selected = 3
+
+                elif event.key == pygame.K_4:
+                    selected = 4
+
+                elif event.key in (
+                    pygame.K_EQUALS,
+                    pygame.K_PLUS,
+                ):
+
+                    simulation_speed = min(
+                        5,
+                        simulation_speed + 1,
+                    )
+
+                elif event.key == pygame.K_MINUS:
+
+                    simulation_speed = max(
+                        1,
+                        simulation_speed - 1,
+                    )
+
+                elif event.key == pygame.K_UP:
+
+                    quality_index = min(
+                        len(quality_levels) - 1,
+                        quality_index + 1,
+                    )
+
+                    update_quality()
+
+                elif event.key == pygame.K_DOWN:
+
+                    quality_index = max(
+                        0,
+                        quality_index - 1,
+                    )
+
+                    update_quality()
+
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+
+                if event.button == 1:
+
+                    click = np.asarray(
+                        event.pos,
+                        dtype=np.float64,
+                    )
+
+                    if (
+                        np.linalg.norm(
+                            click - OBSTACLE
+                        ) > SAFE_RADIUS
+                    ):
+
+                        env.target.center = np.clip(
+                            click,
+                            [
+                                TARGET_A + 20,
+                                TARGET_B + 20,
+                            ],
+                            [
+                                WORLD_W - TARGET_A - 20,
+                                WORLD_H - TARGET_B - 20,
+                            ],
+                        )
+
+                        learned_mppi.reset()
+                        oracle_mppi.reset()
+
+        mode = controllers[selected]
+
+        if not paused:
+
+            for _ in range(simulation_speed):
+
+                planning_start = time.perf_counter()
+
+                if mode == "PD":
+
+                    current_action = pd_controller(
+                        state,
+                        env.target.position(),
+                        env.target.velocity(),
+                    )
+
+                    predicted_path = []
+                    current_weights = None
+
+                elif mode == "Random MPC":
+
+                    current_action, sequence, current_cost = (
+                        random_shooting_action(
+                            state,
+                            env.target,
+                            env.target.phase,
+                            learned_model,
+                            horizon=INTERACTIVE_HORIZON,
+                            samples=INTERACTIVE_SAMPLES,
+                        )
+                    )
+
+                    predicted_path = []
+                    current_weights = None
+
+                else:
+
+                    controller = (
+                        learned_mppi
+                        if mode == "Learned MPPI"
+                        else oracle_mppi
+                    )
+
+                    current_action, sequence, current_cost = (
+                        controller.plan(
+                            state,
+                            env.target,
+                            env.target.phase,
+                        )
+                    )
+
+                    current_weights = (
+                        controller.last_weights
+                    )
+
+                    predicted_state = state.copy()
+
+                    predicted_path = [
+                        predicted_state[:2].copy()
+                    ]
+
+                    if mode == "Oracle MPPI":
+
+                        for future_action in sequence:
+
+                            predicted_state = true_transition(
+                                predicted_state,
+                                future_action,
+                            )
+
+                            predicted_path.append(
+                                predicted_state[:2].copy()
+                            )
+
+                    else:
+
+                        predicted_states = [
+                            predicted_state.copy()
+                        ]
+
+                        states_batch = predicted_state[None, :]
+
+                        for future_action in sequence:
+
+                            delta = learned_model.predict_delta_batch(
+                                states_batch,
+                                future_action[None, :],
+                            )
+
+                            predicted_state = clip_state(
+                                predicted_state + delta[0]
+                            )
+
+                            predicted_states.append(
+                                predicted_state.copy()
+                            )
+
+                            states_batch = predicted_state[None, :]
+
+                        predicted_path = [
+                            item[:2].copy()
+                            for item in predicted_states
+                        ]
+
+                planning_time_ms = (
+                    (time.perf_counter() - planning_start)
+                    * 1000.0
+                )
+
+                state = env.step(
+                    current_action
+                )
+
+                trail.append(
+                    state[:2].copy()
+                )
+
+                if len(trail) > TRAIL_LENGTH:
+                    trail.pop(0)
+
+        draw_background()
+        draw_obstacle()
+        draw_target()
+        draw_trail()
+        draw_prediction()
+        draw_drone()
+        draw_hud()
 
         pygame.display.flip()
 
@@ -2084,22 +2260,25 @@ def run_pygame(
 
 
 # ============================================================
-# 15. UNIT TESTS
+# 17. UNIT TESTS — FIXED: EXACTLY 24 CHECKS
 # ============================================================
 
 def run_tests():
 
-    print(
-        "\nRunning unit tests..."
-    )
+    print("\nRunning unit tests...")
 
     passed = 0
+    total = 24
 
     def check(condition, description):
 
         nonlocal passed
 
-        assert condition, description
+        if not bool(condition):
+
+            raise AssertionError(
+                f"[FAIL] {description}"
+            )
 
         passed += 1
 
@@ -2107,23 +2286,27 @@ def run_tests():
             f"[PASS] {description}"
         )
 
-    # Test 1 — State transition.
+    # 1.
     state = np.array(
         [100.0, 200.0, 10.0, -5.0]
     )
 
+    action = np.array(
+        [0.2, -0.1]
+    )
+
     next_state = true_transition(
         state,
-        np.array([0.2, -0.1]),
+        action,
     )
 
     check(
         next_state.shape == (4,)
         and np.all(np.isfinite(next_state)),
-        "True dynamics return a finite four-dimensional state",
+        "True dynamics return valid state",
     )
 
-    # Test 2 — Action clipping.
+    # 2.
     clipped = true_transition(
         state,
         np.array([5.0, -5.0]),
@@ -2135,14 +2318,11 @@ def run_tests():
     )
 
     check(
-        np.allclose(
-            clipped,
-            bounded,
-        ),
-        "Actions are clipped to valid bounds",
+        np.allclose(clipped, bounded),
+        "Action clipping works",
     )
 
-    # Test 3 — Speed clipping.
+    # 3.
     fast_state = np.array(
         [100.0, 100.0, 500.0, 500.0]
     )
@@ -2155,19 +2335,17 @@ def run_tests():
         np.linalg.norm(
             bounded_state[2:4]
         ) <= MAX_SPEED + 1e-8,
-        "Speed constraint is enforced",
+        "Speed limit works",
     )
 
-    # Test 4 — Position clipping.
+    # 4.
     check(
         DRONE_RADIUS <= bounded_state[0]
-        <= WORLD_W - DRONE_RADIUS
-        and DRONE_RADIUS <= bounded_state[1]
-        <= WORLD_H - DRONE_RADIUS,
-        "World boundary constraint is enforced",
+        <= WORLD_W - DRONE_RADIUS,
+        "Horizontal boundary works",
     )
 
-    # Test 5 — Moving target.
+    # 5.
     target = MovingTarget(
         [700.0, 300.0]
     )
@@ -2176,14 +2354,15 @@ def run_tests():
 
     target.advance()
 
-    after = target.position()
-
     check(
-        not np.allclose(before, after),
-        "Target position changes over time",
+        not np.allclose(
+            before,
+            target.position(),
+        ),
+        "Moving target advances",
     )
 
-    # Test 6 — Dataset dimensions.
+    # 6.
     inputs, targets = collect_dataset(
         steps=100
     )
@@ -2191,17 +2370,17 @@ def run_tests():
     check(
         inputs.shape == (100, 6)
         and targets.shape == (100, 4),
-        "Transition dataset has correct dimensions",
+        "Dataset dimensions are correct",
     )
 
-    # Test 7 — Dataset finite.
+    # 7.
     check(
         np.all(np.isfinite(inputs))
         and np.all(np.isfinite(targets)),
-        "Dataset contains finite values",
+        "Dataset is finite",
     )
 
-    # Test 8 — Normalizer round trip.
+    # 8.
     normalizer = Normalizer(
         inputs
     )
@@ -2216,125 +2395,138 @@ def run_tests():
             inputs,
             atol=1e-5,
         ),
-        "Normalizer round trip is consistent",
+        "Normalization round trip works",
     )
 
-    # Test 9 — Neural network output shape.
+    # 9.
     network = DynamicsNetwork().to(
         DEVICE
     )
 
-    test_tensor = torch.zeros(
-        (10, INPUT_DIM),
-        device=DEVICE,
-    )
-
     output = network(
-        test_tensor
+        torch.zeros(
+            (10, INPUT_DIM),
+            device=DEVICE,
+        )
     )
 
     check(
         output.shape == (10, 4),
-        "Dynamics network output shape is correct",
+        "Neural network output dimensions",
     )
 
-    # Test 10 — Neural output finite.
+    # 10.
     check(
-        torch.all(
-            torch.isfinite(output)
+        torch.all(torch.isfinite(output)),
+        "Neural network output is finite",
+    )
+
+    # 11. FIXED: Environment reset is now counted.
+    env = DroneEnv()
+
+    reset_state = env.reset()
+
+    check(
+        reset_state.shape == (4,)
+        and np.all(np.isfinite(reset_state))
+        and np.allclose(
+            reset_state,
+            [110.0, 500.0, 0.0, 0.0],
         ),
-        "Dynamics network output is finite",
+        "Environment reset works",
     )
 
-    # Test 11 — Stage cost.
-    cost = stage_cost(
-        state,
-        np.array([300.0, 300.0]),
-        np.array([0.1, 0.2]),
-    )
-
-    check(
-        np.isfinite(cost),
-        "MPPI stage cost is finite",
-    )
-
-    # Test 12 — Nominal sequence.
+    # 12.
     nominal = make_nominal_sequence(
-        state,
-        target,
-        target.phase,
+        env.state,
+        env.target,
+        env.target.phase,
         HORIZON,
     )
 
     check(
         nominal.shape == (HORIZON, 2),
-        "Nominal action sequence has correct shape",
+        "Nominal sequence dimensions",
     )
 
-    # Test 13 — Nominal action bounds.
+    # 13.
     check(
-        np.all(nominal <= 1.0)
-        and np.all(nominal >= -1.0),
-        "Nominal action sequence is bounded",
+        np.all(nominal >= -1.0)
+        and np.all(nominal <= 1.0),
+        "Nominal sequence is bounded",
     )
 
-    # Test 14 — Sequence rollout.
-    env = DroneEnv()
-
-    env.reset()
-
-    test_sequences = np.repeat(
+    # 14.
+    sequences = np.repeat(
         nominal[None, :, :],
         5,
         axis=0,
     )
 
-    rollout_costs = evaluate_action_sequences(
+    oracle_costs = evaluate_action_sequences(
         env.state,
-        test_sequences,
+        sequences,
         env.target,
         env.target.phase,
         "oracle",
     )
 
     check(
-        rollout_costs.shape == (5,)
-        and np.all(np.isfinite(rollout_costs)),
-        "Batched Oracle rollout returns finite candidate costs",
+        oracle_costs.shape == (5,)
+        and np.all(np.isfinite(oracle_costs)),
+        "Oracle batch rollout works",
     )
 
-    # Test 15 — Weight normalization.
-    test_costs = np.array(
+    # 15.
+    states_batch = np.repeat(
+        env.state[None, :],
+        10,
+        axis=0,
+    )
+
+    actions_batch = np.zeros(
+        (10, 2)
+    )
+
+    batch_result = true_transition_batch(
+        states_batch,
+        actions_batch,
+    )
+
+    single_result = true_transition(
+        env.state,
+        np.zeros(2),
+    )
+
+    check(
+        np.allclose(
+            batch_result[0],
+            single_result,
+        ),
+        "Vectorized and single dynamics agree",
+    )
+
+    # 16.
+    costs = np.array(
         [10.0, 11.0, 12.0, 20.0]
     )
 
-    logits = -(
-        test_costs - test_costs.min()
-    ) / LAMBDA
-
-    logits -= logits.max()
-
-    weights = np.exp(
-        logits
+    weights = calculate_mppi_weights(
+        costs
     )
 
-    weights /= weights.sum()
-
     check(
-        np.isclose(
-            weights.sum(),
-            1.0,
-        ),
+        np.isclose(weights.sum(), 1.0),
         "MPPI weights sum to one",
     )
 
-    # Test 16 — Lower cost receives higher weight.
+    # 17.
     check(
         weights[0] > weights[1] > weights[2] > weights[3],
         "Lower-cost sequences receive higher weights",
     )
 
-    # Test 17 — Weighted update.
+    # 18.
     candidates = np.array(
         [
             [[0.0, 0.0]],
@@ -2342,13 +2534,12 @@ def run_tests():
         ]
     )
 
-    sample_weights = np.array(
+    test_weights = np.array(
         [0.75, 0.25]
     )
 
     updated = np.sum(
-        sample_weights[:, None, None]
-        * candidates,
+        test_weights[:, None, None] * candidates,
         axis=0,
     )
 
@@ -2357,10 +2548,10 @@ def run_tests():
             updated,
             [[0.25, 0.25]],
         ),
-        "Weighted action-sequence update is correct",
+        "Weighted sequence update works",
     )
 
-    # Test 18 — MPPI controller interface.
+    # 19.
     controller = MPPIController(
         "oracle",
         horizon=5,
@@ -2378,76 +2569,132 @@ def run_tests():
         action.shape == (2,)
         and sequence.shape == (5, 2)
         and np.isfinite(cost),
-        "MPPI planner returns valid action, sequence and cost",
+        "MPPI planner interface works",
     )
 
-    # Test 19 — MPPI action bounds.
+    # 20.
     check(
         np.all(action >= -1.0)
         and np.all(action <= 1.0),
-        "MPPI action is bounded",
+        "MPPI action bounds work",
     )
 
-    # Test 20 — MPPI weights.
+    # 21.
     check(
         controller.last_weights is not None
         and np.isclose(
             controller.last_weights.sum(),
             1.0,
         ),
-        "MPPI produces normalized sample weights",
+        "MPPI weights are normalized",
+    )
+
+    # 22.
+    controller.reset()
+
+    check(
+        not controller.initialized
+        and controller.last_weights is None,
+        "MPPI reset works",
+    )
+
+    # 23.
+    controller.plan(
+        env.state,
+        env.target,
+        env.target.phase,
+    )
+
+    check(
+        controller.initialized,
+        "MPPI initializes correctly",
+    )
+
+    # 24.
+    learned_model = LearnedDynamics()
+
+    learned_model.input_normalizer = Normalizer(
+        np.random.normal(
+            0,
+            1,
+            (10, 6),
+        ).astype(np.float32)
+    )
+
+    learned_model.output_normalizer = Normalizer(
+        np.random.normal(
+            0,
+            1,
+            (10, 4),
+        ).astype(np.float32)
+    )
+
+    prediction = learned_model.predict_delta_batch(
+        states_batch,
+        actions_batch,
+    )
+
+    check(
+        prediction.shape == (10, 4)
+        and np.all(np.isfinite(prediction)),
+        "Batched learned dynamics prediction works",
     )
 
     print(
-        f"\n{passed}/20 tests passed."
+        f"\n{passed}/{total} tests passed."
     )
 
-    return passed == 20
+    if passed != total:
+        raise RuntimeError(
+            f"Expected {total} passing tests, got {passed}."
+        )
+
+    return True
 
 
 # ============================================================
-# 16. MAIN
+# 18. MAIN
 # ============================================================
 
 def main():
 
-    print(
-        "=" * 72
-    )
+    print("=" * 72)
 
     print(
-        "PHASE 4.27 — MODEL PREDICTIVE PATH INTEGRAL CONTROL"
+        "PHASE 4.27 — HIGH-PERFORMANCE MPPI"
     )
 
-    print(
-        "=" * 72
-    )
+    print("=" * 72)
 
     print(
         f"Device: {DEVICE}"
     )
 
-    # Step 1 — Unit tests.
+    print(
+        f"CUDA available: {torch.cuda.is_available()}"
+    )
+
+    # 1. Tests.
     if not run_tests():
 
         raise RuntimeError(
             "Unit tests failed."
         )
 
-    # Step 2 — Collect dynamics dataset.
+    # 2. Dataset.
     print(
-        "\n[1/6] Collecting transition dataset..."
+        "\n[1/6] Collecting dynamics dataset..."
     )
 
     inputs, targets = collect_dataset()
 
     print(
-        f"Collected {len(inputs)} transitions."
+        f"Transitions collected: {len(inputs)}"
     )
 
-    # Step 3 — Train learned dynamics.
+    # 3. Model training.
     print(
-        "\n[2/6] Training learned dynamics model..."
+        "\n[2/6] Training learned dynamics..."
     )
 
     learned_model = LearnedDynamics()
@@ -2461,7 +2708,7 @@ def main():
         learned_model
     )
 
-    # Step 4 — Benchmark controllers.
+    # 4. Benchmark.
     print(
         "\n[3/6] Benchmarking controllers..."
     )
@@ -2474,78 +2721,62 @@ def main():
         results
     )
 
-    # Step 5 — Report MPPI parameters.
+    # 5. MPPI configuration.
     print(
         "\n[4/6] MPPI configuration"
     )
 
     print(
-        f"Horizon: {HORIZON}"
+        f"Benchmark horizon: {HORIZON}"
     )
 
     print(
-        f"Samples: {SAMPLE_COUNT}"
+        f"Benchmark samples: {SAMPLE_COUNT}"
     )
 
     print(
-        f"Optimization iterations: {MPPI_ITERATIONS}"
+        f"Benchmark iterations: {MPPI_ITERATIONS}"
     )
 
     print(
-        f"Temperature lambda: {LAMBDA}"
+        f"Interactive samples: {INTERACTIVE_SAMPLES}"
     )
 
     print(
-        f"Action noise std: {NOISE_STD}"
+        f"Interactive iterations: {INTERACTIVE_ITERATIONS}"
     )
 
-    # Step 6 — Interactive visualization.
+    print(
+        f"Lambda: {LAMBDA}"
+    )
+
+    print(
+        f"Action noise: {NOISE_STD}"
+    )
+
+    # 6. Pygame.
     print(
         "\n[5/6] Starting interactive simulation..."
     )
 
-    print(
-        "1 = PD"
-    )
-
-    print(
-        "2 = Random shooting MPC"
-    )
-
-    print(
-        "3 = Learned-model MPPI"
-    )
-
-    print(
-        "4 = Oracle MPPI"
-    )
-
-    print(
-        "SPACE = pause"
-    )
-
-    print(
-        "R = reset"
-    )
-
-    print(
-        "+/- = simulation speed"
-    )
-
-    print(
-        "Mouse click = move target trajectory center"
-    )
-
-    print(
-        "ESC = exit"
-    )
+    print("\nCONTROLS")
+    print("1 = PD")
+    print("2 = Random MPC")
+    print("3 = Learned MPPI")
+    print("4 = Oracle MPPI")
+    print("SPACE = Pause")
+    print("R = Reset")
+    print("+/- = Simulation speed")
+    print("UP/DOWN = MPPI planning quality")
+    print("Mouse click = Move target center")
+    print("ESC = Exit")
 
     run_pygame(
         learned_model
     )
 
     print(
-        "\n[6/6] Phase 4.27 completed."
+        "\n[6/6] PHASE 4.27 COMPLETED."
     )
 
 

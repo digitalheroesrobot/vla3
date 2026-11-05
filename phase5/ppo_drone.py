@@ -1,116 +1,61 @@
-
 """
 File: phase5/ppo_drone.py
 
-PHASE 5.6 — PROXIMAL POLICY OPTIMIZATION (PPO)
-============================================================
+PHASE 5.7 — ADVANCED PROXIMAL POLICY OPTIMIZATION
+=================================================
 
 PURPOSE
 -------
-Implement PPO from scratch using PyTorch for continuous
-quadcopter navigation and moving-target tracking.
+Train a quadcopter to track a moving target while avoiding
+obstacles using an improved PPO implementation from scratch.
 
-WHAT YOU LEARN
---------------
+IMPROVEMENTS
+------------
+1. Separate Actor and Critic networks.
+2. Orthogonal initialization.
+3. Improved reward shaping.
+4. Improved obstacle avoidance.
+5. Better Gaussian exploration.
+6. Larger rollout horizon.
+7. Linear learning-rate annealing.
+8. PPO clipped surrogate objective.
+9. KL-based early stopping.
+10. Correct GAE terminal/truncation handling.
+11. Persistent episode-return tracking.
+12. Training diagnostics.
+13. Evaluation across randomized trajectories.
+14. Interactive Pygame visualization.
 
-STEP 1 — Gaussian Actor-Critic
-    Build a continuous stochastic policy and value network.
+ALGORITHM
+---------
+PPO + GAE + Tanh Gaussian Policy
 
-STEP 2 — Action Transformation
-    Transform Gaussian actions through tanh and correctly
-    calculate the transformed action's log probability.
+ACTION
+------
+[ax, ay] in [-1, 1]
 
-STEP 3 — Rollout Collection
-    Collect states, actions, rewards, values and old log
-    probabilities using the current policy.
-
-STEP 4 — GAE
-    Calculate advantages while handling terminal and
-    truncated transitions correctly.
-
-STEP 5 — PPO Clipped Objective
-    Calculate the probability ratio and clipped surrogate
-    objective.
-
-STEP 6 — Multiple Epochs
-    Reuse rollout data for multiple shuffled minibatch
-    optimization epochs.
-
-STEP 7 — Policy Diagnostics
-    Monitor approximate KL divergence, clip fraction,
-    entropy, actor loss and critic loss.
-
-STEP 8 — Robotics Visualization
-    Train a simulated quadcopter to track a moving target
-    while avoiding an obstacle.
-
-MATHEMATICS
+OBSERVATION
 -----------
+1. Relative target position (2)
+2. Relative target velocity (2)
+3. Drone velocity (2)
+4. Relative obstacle position (2)
+5. Target phase (2)
 
-Probability ratio:
+Total: 10 dimensions.
 
-    ratio = exp(new_log_prob - old_log_prob)
-
-Clipped surrogate:
-
-    L_clip = mean(
-        min(
-            ratio * advantage,
-            clip(ratio, 1-eps, 1+eps) * advantage
-        )
-    )
-
-Value loss:
-
-    L_value = 0.5 * mean((V(s)-return)^2)
-
-Entropy:
-
-    H = -E[log pi(a|s)]
-
-Total minimized loss:
-
-    loss = -L_clip
-           + VALUE_COEF * L_value
-           - ENTROPY_COEF * H
-
-GAE:
-
-    delta[t] = reward[t]
-               + gamma * next_value[t] * (1-terminated[t])
-               - value[t]
-
-    A[t] = delta[t]
-           + gamma * lambda
-             * (1-terminated[t])
-             * (1-truncated[t])
-             * A[t+1]
-
-IMPORTANT IMPLEMENTATION DETAILS
---------------------------------
-
-1. Old log probabilities are stored during rollout collection.
-2. New log probabilities are calculated during optimization.
-3. PPO ratio compares the new and old policy probabilities.
-4. The rollout data remains fixed throughout PPO epochs.
-5. True termination suppresses value bootstrapping.
-6. Time-limit truncation bootstraps from the final observation.
-7. GAE recursion stops at both terminal and truncation boundaries.
-8. Tanh-transformed Gaussian actions use the Jacobian correction.
-
-ROBOTICS APPLICATION
---------------------
-
-A simplified 2D quadcopter tracks a continuously moving
-target while avoiding a circular obstacle.
-
-This is an educational simulation, not flight-certified.
+IMPORTANT
+---------
+Educational 2D simulation.
+Not suitable for real flight without additional
+control, perception and safety systems.
 """
 
 from __future__ import annotations
 
 import math
 import random
+from collections import deque
 
 import numpy as np
 import torch
@@ -129,9 +74,16 @@ random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
 DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
+
+# ------------------------------------------------------------
+# Environment
+# ------------------------------------------------------------
 
 WORLD_W = 900
 WORLD_H = 650
@@ -139,23 +91,34 @@ WORLD_H = 650
 DT = 0.08
 
 DRONE_RADIUS = 12.0
-MAX_SPEED = 150.0
-MAX_ACCEL = 125.0
+
+MAX_SPEED = 180.0
+MAX_ACCEL = 180.0
 
 OBSTACLE = np.array(
     [450.0, 330.0],
     dtype=np.float32,
 )
 
-OBSTACLE_RADIUS = 62.0
-SAFE_RADIUS = 112.0
+OBSTACLE_RADIUS = 58.0
+SAFE_RADIUS = 90.0
 
 TARGET_A = 145.0
 TARGET_B = 95.0
 TARGET_OMEGA = 0.55
 
+MAX_EPISODE_STEPS = 300
+
+# ------------------------------------------------------------
+# Observation and action
+# ------------------------------------------------------------
+
 OBS_DIM = 10
 ACTION_DIM = 2
+
+# ------------------------------------------------------------
+# PPO
+# ------------------------------------------------------------
 
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
@@ -163,31 +126,53 @@ GAE_LAMBDA = 0.95
 CLIP_EPSILON = 0.20
 
 VALUE_COEF = 0.5
-ENTROPY_COEF = 0.005
+ENTROPY_COEF = 0.003
 
 LEARNING_RATE = 3e-4
+MIN_LEARNING_RATE = 3e-5
+
 MAX_GRAD_NORM = 0.5
 
 NUM_ENVS = 8
-ROLLOUT_STEPS = 128
 
-PPO_EPOCHS = 6
-MINIBATCH_SIZE = 128
+ROLLOUT_STEPS = 256
+
+PPO_EPOCHS = 8
+
+MINIBATCH_SIZE = 256
 
 TRAIN_UPDATES = 500
 
-MAX_EPISODE_STEPS = 180
-
-TARGET_KL = 0.03
+TARGET_KL = 0.025
 
 PRINT_INTERVAL = 10
 
-# Quick test:
-#
-# NUM_ENVS = 4
-# ROLLOUT_STEPS = 32
-# PPO_EPOCHS = 2
-# TRAIN_UPDATES = 20
+EVAL_EPISODES = 10
+
+# ------------------------------------------------------------
+# Reward parameters
+# ------------------------------------------------------------
+
+TRACKING_SCALE = 100.0
+
+PROGRESS_COEF = 0.8
+TRACKING_COEF = 1.2
+
+ACTION_PENALTY = 0.015
+
+OBSTACLE_PENALTY = 0.025
+
+BOUNDARY_PENALTY = 0.02
+
+COLLISION_PENALTY = 30.0
+
+# ------------------------------------------------------------
+# Network
+# ------------------------------------------------------------
+
+HIDDEN_DIM = 256
+
+INITIAL_LOG_STD = -0.5
 
 
 # ============================================================
@@ -286,8 +271,8 @@ def drone_dynamics(state, action):
     velocity = state[2:4]
 
     acceleration = (
-        0.78 * MAX_ACCEL * action
-        - 0.13 * velocity
+        MAX_ACCEL * action
+        - 0.10 * velocity
         + np.array(
             [3.0, -2.0],
             dtype=np.float32,
@@ -325,6 +310,7 @@ class DroneEnv:
         )
 
         self.state = None
+
         self.steps = 0
 
         self.reset()
@@ -332,6 +318,7 @@ class DroneEnv:
     def observation(self):
 
         position = self.state[:2]
+
         velocity = self.state[2:4]
 
         target_position = (
@@ -342,12 +329,28 @@ class DroneEnv:
             self.target.velocity()
         )
 
+        relative_position = (
+            target_position - position
+        )
+
+        relative_velocity = (
+            target_velocity - velocity
+        )
+
+        relative_obstacle = (
+            OBSTACLE - position
+        )
+
         return np.concatenate(
             [
-                (target_position - position) / 400.0,
-                target_velocity / 200.0,
+                relative_position / 300.0,
+
+                relative_velocity / 180.0,
+
                 velocity / MAX_SPEED,
-                (OBSTACLE - position) / 400.0,
+
+                relative_obstacle / 300.0,
+
                 [
                     math.sin(self.target.phase),
                     math.cos(self.target.phase),
@@ -418,39 +421,85 @@ class DroneEnv:
             WORLD_H - self.state[1],
         )
 
-        collision = (
-            obstacle_distance < OBSTACLE_RADIUS
+        # ----------------------------------------------------
+        # 1. Tracking reward
+        # ----------------------------------------------------
+
+        tracking_reward = (
+            TRACKING_COEF
+            * math.exp(
+                -distance_after / TRACKING_SCALE
+            )
         )
 
-        reward = (
-            0.08 * (
-                distance_before - distance_after
+        # ----------------------------------------------------
+        # 2. Progress reward
+        # ----------------------------------------------------
+
+        progress_reward = (
+            PROGRESS_COEF
+            * np.clip(
+                (distance_before - distance_after) / 10.0,
+                -2.0,
+                2.0,
             )
-            - 0.010 * distance_after
-            - 0.10 * np.sum(
+        )
+
+        # ----------------------------------------------------
+        # 3. Action penalty
+        # ----------------------------------------------------
+
+        action_cost = (
+            ACTION_PENALTY
+            * np.sum(
                 np.asarray(action) ** 2
             )
         )
 
-        reward -= (
-            0.006
-            * max(
-                0.0,
-                SAFE_RADIUS - obstacle_distance,
+        # ----------------------------------------------------
+        # 4. Obstacle avoidance
+        # ----------------------------------------------------
+
+        obstacle_cost = (
+            OBSTACLE_PENALTY
+            * (
+                max(
+                    0.0,
+                    SAFE_RADIUS - obstacle_distance,
+                ) / SAFE_RADIUS
             ) ** 2
         )
 
-        reward -= (
-            0.015
-            * max(
-                0.0,
-                55.0 - boundary_distance,
+        # ----------------------------------------------------
+        # 5. Boundary avoidance
+        # ----------------------------------------------------
+
+        boundary_cost = (
+            BOUNDARY_PENALTY
+            * (
+                max(
+                    0.0,
+                    55.0 - boundary_distance,
+                ) / 55.0
             ) ** 2
+        )
+
+        reward = (
+            tracking_reward
+            + progress_reward
+            - action_cost
+            - obstacle_cost
+            - boundary_cost
+        )
+
+        collision = (
+            obstacle_distance
+            < OBSTACLE_RADIUS + DRONE_RADIUS
         )
 
         if collision:
 
-            reward -= 100.0
+            reward -= COLLISION_PENALTY
 
         self.steps += 1
 
@@ -458,13 +507,22 @@ class DroneEnv:
             collision
         )
 
-        truncated = (
+        truncated = bool(
             self.steps >= MAX_EPISODE_STEPS
         )
 
         info = {
             "distance": float(distance_after),
+
+            "obstacle_distance": float(
+                obstacle_distance
+            ),
+
             "collision": collision,
+
+            "tracking_reward": float(
+                tracking_reward
+            ),
         }
 
         return (
@@ -503,10 +561,13 @@ class ParallelEnvironments:
     def step(self, actions):
 
         next_observations = []
+
         final_observations = []
 
         rewards = []
+
         terminated_flags = []
+
         truncated_flags = []
 
         infos = []
@@ -554,101 +615,148 @@ class ParallelEnvironments:
 
         return (
             np.stack(next_observations),
+
             np.stack(final_observations),
-            np.asarray(rewards, dtype=np.float32),
-            np.asarray(terminated_flags, dtype=np.float32),
-            np.asarray(truncated_flags, dtype=np.float32),
+
+            np.asarray(
+                rewards,
+                dtype=np.float32,
+            ),
+
+            np.asarray(
+                terminated_flags,
+                dtype=np.float32,
+            ),
+
+            np.asarray(
+                truncated_flags,
+                dtype=np.float32,
+            ),
+
             infos,
         )
 
 
 # ============================================================
-# 5. ACTOR-CRITIC NETWORK
+# 5. NETWORK INITIALIZATION
 # ============================================================
 
-class ActorCritic(nn.Module):
+def initialize_linear(layer, gain):
+
+    nn.init.orthogonal_(
+        layer.weight,
+        gain=gain,
+    )
+
+    nn.init.constant_(
+        layer.bias,
+        0.0,
+    )
+
+
+# ============================================================
+# 6. SEPARATE ACTOR NETWORK
+# ============================================================
+
+class Actor(nn.Module):
 
     def __init__(self):
 
         super().__init__()
 
-        self.shared = nn.Sequential(
-            nn.Linear(OBS_DIM, 128),
+        self.layers = nn.Sequential(
+
+            nn.Linear(
+                OBS_DIM,
+                HIDDEN_DIM,
+            ),
+
             nn.Tanh(),
 
-            nn.Linear(128, 128),
+            nn.Linear(
+                HIDDEN_DIM,
+                HIDDEN_DIM,
+            ),
+
+            nn.Tanh(),
+
+            nn.Linear(
+                HIDDEN_DIM,
+                HIDDEN_DIM,
+            ),
+
             nn.Tanh(),
         )
 
-        self.actor_mean = nn.Linear(
-            128,
+        self.mean = nn.Linear(
+            HIDDEN_DIM,
             ACTION_DIM,
         )
 
-        self.actor_log_std = nn.Parameter(
+        self.log_std = nn.Parameter(
             torch.full(
                 (ACTION_DIM,),
-                -0.5,
+                INITIAL_LOG_STD,
             )
         )
 
-        self.critic = nn.Linear(
-            128,
-            1,
+        # Orthogonal initialization.
+
+        for layer in self.layers:
+
+            if isinstance(
+                layer,
+                nn.Linear,
+            ):
+
+                initialize_linear(
+                    layer,
+                    math.sqrt(2.0),
+                )
+
+        initialize_linear(
+            self.mean,
+            0.01,
         )
 
     def forward(self, states):
 
-        features = self.shared(states)
+        features = self.layers(
+            states
+        )
 
-        mean = self.actor_mean(
+        mean = self.mean(
             features
         )
 
         log_std = torch.clamp(
-            self.actor_log_std,
-            -5.0,
+            self.log_std,
+            -3.0,
             1.0,
         )
 
-        value = self.critic(
-            features
-        ).squeeze(-1)
-
-        return mean, log_std, value
+        return mean, log_std
 
     def distribution(self, states):
 
-        mean, log_std, value = self(
-            states
-        )
+        mean, log_std = self(states)
 
-        distribution = torch.distributions.Normal(
+        return torch.distributions.Normal(
             mean,
             log_std.exp(),
         )
 
-        return distribution, value
-
     def sample(self, states):
 
-        distribution, value = (
-            self.distribution(states)
+        distribution = self.distribution(
+            states
         )
 
-        # Sample raw Gaussian action.
         raw_action = distribution.sample()
 
-        # Transform to the bounded action interval.
         action = torch.tanh(
             raw_action
         )
-
-        # Change-of-variables correction:
-        #
-        # log pi(a) =
-        # log N(u; mean,std)
-        # - sum(log(1-tanh(u)^2))
 
         log_prob = distribution.log_prob(
             raw_action
@@ -666,7 +774,6 @@ class ActorCritic(nn.Module):
             action,
             raw_action,
             log_prob,
-            value,
         )
 
     def evaluate_actions(
@@ -675,8 +782,8 @@ class ActorCritic(nn.Module):
         raw_actions,
     ):
 
-        distribution, value = (
-            self.distribution(states)
+        distribution = self.distribution(
+            states
         )
 
         action = torch.tanh(
@@ -695,29 +802,145 @@ class ActorCritic(nn.Module):
             dim=-1
         )
 
-        # Entropy of the unsquashed Gaussian.
-        # This is a common PPO approximation for
-        # tanh-squashed continuous policies.
-
         entropy = distribution.entropy().sum(
             dim=-1
         )
 
-        return (
-            log_prob,
-            entropy,
-            value,
-        )
+        return log_prob, entropy
 
     def deterministic_action(self, states):
 
-        mean, _, _ = self(states)
+        mean, _ = self(states)
 
         return torch.tanh(mean)
 
 
 # ============================================================
-# 6. GAE
+# 7. SEPARATE CRITIC NETWORK
+# ============================================================
+
+class Critic(nn.Module):
+
+    def __init__(self):
+
+        super().__init__()
+
+        self.layers = nn.Sequential(
+
+            nn.Linear(
+                OBS_DIM,
+                HIDDEN_DIM,
+            ),
+
+            nn.Tanh(),
+
+            nn.Linear(
+                HIDDEN_DIM,
+                HIDDEN_DIM,
+            ),
+
+            nn.Tanh(),
+
+            nn.Linear(
+                HIDDEN_DIM,
+                HIDDEN_DIM,
+            ),
+
+            nn.Tanh(),
+
+            nn.Linear(
+                HIDDEN_DIM,
+                1,
+            ),
+        )
+
+        for layer in self.layers:
+
+            if isinstance(
+                layer,
+                nn.Linear,
+            ):
+
+                initialize_linear(
+                    layer,
+                    math.sqrt(2.0),
+                )
+
+        initialize_linear(
+            self.layers[-1],
+            1.0,
+        )
+
+    def forward(self, states):
+
+        return self.layers(
+            states
+        ).squeeze(-1)
+
+
+# ============================================================
+# 8. ACTOR-CRITIC
+# ============================================================
+
+class ActorCritic(nn.Module):
+
+    def __init__(self):
+
+        super().__init__()
+
+        self.actor = Actor()
+
+        self.critic = Critic()
+
+    def sample(self, states):
+
+        actions, raw_actions, log_probs = (
+            self.actor.sample(states)
+        )
+
+        values = self.critic(
+            states
+        )
+
+        return (
+            actions,
+            raw_actions,
+            log_probs,
+            values,
+        )
+
+    def evaluate_actions(
+        self,
+        states,
+        raw_actions,
+    ):
+
+        log_probs, entropy = (
+            self.actor.evaluate_actions(
+                states,
+                raw_actions,
+            )
+        )
+
+        values = self.critic(
+            states
+        )
+
+        return (
+            log_probs,
+            entropy,
+            values,
+        )
+
+    def deterministic_action(self, states):
+
+        return self.actor.deterministic_action(
+            states
+        )
+
+
+# ============================================================
+# 9. GENERALIZED ADVANTAGE ESTIMATION
 # ============================================================
 
 def compute_gae(
@@ -746,9 +969,15 @@ def compute_gae(
         range(T)
     ):
 
+        # True termination:
+        # Do not bootstrap from next state.
+
         bootstrap_mask = (
             1.0 - terminated[t]
         )
+
+        # Both termination and truncation:
+        # Stop GAE recursion across episode boundaries.
 
         continuation_mask = (
             1.0
@@ -784,7 +1013,7 @@ def compute_gae(
 
 
 # ============================================================
-# 7. PPO AGENT
+# 10. PPO AGENT
 # ============================================================
 
 class PPOAgent:
@@ -820,8 +1049,11 @@ class PPOAgent:
 
         return (
             actions.cpu().numpy(),
+
             raw_actions.cpu().numpy(),
+
             log_probs.cpu().numpy(),
+
             values.cpu().numpy(),
         )
 
@@ -835,7 +1067,9 @@ class PPOAgent:
 
         with torch.no_grad():
 
-            _, _, values = self.network(states)
+            values = self.network.critic(
+                states
+            )
 
         return values.cpu().numpy()
 
@@ -849,11 +1083,37 @@ class PPOAgent:
 
         with torch.no_grad():
 
-            actions = self.network.deterministic_action(
-                states
+            actions = (
+                self.network.deterministic_action(
+                    states
+                )
             )
 
         return actions.squeeze(0).cpu().numpy()
+
+    def set_learning_rate(self, update):
+
+        progress = (
+            update / max(
+                1,
+                TRAIN_UPDATES - 1,
+            )
+        )
+
+        lr = (
+            LEARNING_RATE
+            - progress
+            * (
+                LEARNING_RATE
+                - MIN_LEARNING_RATE
+            )
+        )
+
+        for group in self.optimizer.param_groups:
+
+            group["lr"] = lr
+
+        return lr
 
     def update(
         self,
@@ -894,7 +1154,6 @@ class PPOAgent:
             device=DEVICE,
         )
 
-        # Normalize advantages across the rollout.
         advantages = (
             advantages - advantages.mean()
         ) / (
@@ -929,28 +1188,28 @@ class PPOAgent:
                 MINIBATCH_SIZE,
             ):
 
-                minibatch_indices = indices[
+                mb_indices = indices[
                     start:start + MINIBATCH_SIZE
                 ]
 
                 mb_states = states[
-                    minibatch_indices
+                    mb_indices
                 ]
 
                 mb_actions = actions[
-                    minibatch_indices
+                    mb_indices
                 ]
 
                 mb_old_log_probs = old_log_probs[
-                    minibatch_indices
+                    mb_indices
                 ]
 
                 mb_advantages = advantages[
-                    minibatch_indices
+                    mb_indices
                 ]
 
                 mb_returns = returns[
-                    minibatch_indices
+                    mb_indices
                 ]
 
                 (
@@ -962,7 +1221,10 @@ class PPOAgent:
                     mb_actions,
                 )
 
-                # PPO probability ratio.
+                # ----------------------------------------
+                # PPO probability ratio
+                # ----------------------------------------
+
                 log_ratio = (
                     new_log_probs
                     - mb_old_log_probs
@@ -972,12 +1234,14 @@ class PPOAgent:
                     log_ratio
                 )
 
-                # Unclipped policy objective.
+                # ----------------------------------------
+                # Clipped surrogate objective
+                # ----------------------------------------
+
                 surrogate_1 = (
                     ratio * mb_advantages
                 )
 
-                # Clipped policy objective.
                 clipped_ratio = torch.clamp(
                     ratio,
                     1.0 - CLIP_EPSILON,
@@ -988,15 +1252,22 @@ class PPOAgent:
                     clipped_ratio * mb_advantages
                 )
 
-                # We minimize negative PPO objective.
                 actor_loss = -torch.minimum(
                     surrogate_1,
                     surrogate_2,
                 ).mean()
 
+                # ----------------------------------------
+                # Critic loss
+                # ----------------------------------------
+
                 critic_loss = 0.5 * (
                     values - mb_returns
                 ).pow(2).mean()
+
+                # ----------------------------------------
+                # Entropy regularization
+                # ----------------------------------------
 
                 entropy_mean = entropy.mean()
 
@@ -1006,7 +1277,13 @@ class PPOAgent:
                     - ENTROPY_COEF * entropy_mean
                 )
 
-                self.optimizer.zero_grad()
+                # ----------------------------------------
+                # Optimization
+                # ----------------------------------------
+
+                self.optimizer.zero_grad(
+                    set_to_none=True
+                )
 
                 total_loss.backward()
 
@@ -1017,9 +1294,12 @@ class PPOAgent:
 
                 self.optimizer.step()
 
+                # ----------------------------------------
+                # Diagnostics
+                # ----------------------------------------
+
                 with torch.no_grad():
 
-                    # Approximate reverse KL estimator.
                     approx_kl = (
                         (ratio - 1.0) - log_ratio
                     ).mean()
@@ -1057,11 +1337,7 @@ class PPOAgent:
                     ratio.mean().item()
                 )
 
-                # Stop additional epochs if the policy
-                # moves too far from the rollout policy.
-                #
-                # This is an optional safeguard, not
-                # a replacement for PPO clipping.
+                # KL early stopping.
 
                 if (
                     approx_kl.item()
@@ -1083,33 +1359,33 @@ class PPOAgent:
 
 
 # ============================================================
-# 8. ROLLOUT COLLECTION
+# 11. ROLLOUT COLLECTION
 # ============================================================
 
 def collect_rollout(
     agent,
     envs,
     observations,
+    episode_returns,
 ):
 
     obs_buffer = []
+
     raw_action_buffer = []
 
     old_log_prob_buffer = []
 
     reward_buffer = []
+
     value_buffer = []
+
     next_value_buffer = []
 
     terminated_buffer = []
+
     truncated_buffer = []
 
     distance_buffer = []
-
-    episode_returns = np.zeros(
-        NUM_ENVS,
-        dtype=np.float32,
-    )
 
     completed_returns = []
 
@@ -1135,8 +1411,9 @@ def collect_rollout(
             infos,
         ) = envs.step(actions)
 
-        # Evaluate the true final transition observation,
-        # not the reset observation returned for the next step.
+        # Always evaluate the actual final observation.
+        # Never use an automatically reset observation
+        # for time-limit bootstrapping.
 
         next_values = agent.predict_values(
             final_observations
@@ -1184,6 +1461,8 @@ def collect_rollout(
             )
         )
 
+        # Maintain episode returns across rollouts.
+
         episode_returns += rewards
 
         for i in range(NUM_ENVS):
@@ -1199,6 +1478,7 @@ def collect_rollout(
         observations = next_observations
 
     rollout = {
+
         "observations": np.asarray(
             obs_buffer,
             dtype=np.float32,
@@ -1248,12 +1528,13 @@ def collect_rollout(
     return (
         rollout,
         observations,
+        episode_returns,
         completed_returns,
     )
 
 
 # ============================================================
-# 9. PPO TRAINING
+# 12. TRAINING
 # ============================================================
 
 def train():
@@ -1266,15 +1547,36 @@ def train():
 
     observations = envs.reset()
 
+    episode_returns = np.zeros(
+        NUM_ENVS,
+        dtype=np.float32,
+    )
+
+    completed_return_history = deque(
+        maxlen=100
+    )
+
     history = {
+
         "reward": [],
+
+        "episode_return": [],
+
         "distance": [],
+
         "actor_loss": [],
+
         "critic_loss": [],
+
         "entropy": [],
+
         "approx_kl": [],
+
         "clip_fraction": [],
+
         "ratio_mean": [],
+
+        "learning_rate": [],
     }
 
     all_episode_returns = []
@@ -1283,17 +1585,27 @@ def train():
         TRAIN_UPDATES
     ):
 
+        lr = agent.set_learning_rate(
+            update
+        )
+
         (
             rollout,
             observations,
+            episode_returns,
             completed_returns,
         ) = collect_rollout(
             agent,
             envs,
             observations,
+            episode_returns,
         )
 
         all_episode_returns.extend(
+            completed_returns
+        )
+
+        completed_return_history.extend(
             completed_returns
         )
 
@@ -1303,11 +1615,9 @@ def train():
             rollout["next_values"],
             rollout["terminated"],
             rollout["truncated"],
-            GAMMA,
-            GAE_LAMBDA,
         )
 
-        # Flatten [T,N,...] into a single batch.
+        # Flatten rollout dimensions.
 
         states = rollout[
             "observations"
@@ -1357,6 +1667,20 @@ def train():
             )
         )
 
+        history["episode_return"].append(
+            float(
+                np.mean(
+                    completed_return_history
+                )
+            )
+            if completed_return_history
+            else np.nan
+        )
+
+        history["learning_rate"].append(
+            lr
+        )
+
         for key in (
             "actor_loss",
             "critic_loss",
@@ -1381,12 +1705,24 @@ def train():
 
             print(
                 f"Update {update + 1:4d}/{TRAIN_UPDATES}"
-                f" | Reward={np.mean(history['reward'][recent]):8.2f}"
+
+                f" | Reward={np.mean(history['reward'][recent]):8.3f}"
+
                 f" | Distance={np.mean(history['distance'][recent]):7.2f}"
-                f" | Actor={np.mean(history['actor_loss'][recent]):8.3f}"
-                f" | Critic={np.mean(history['critic_loss'][recent]):8.3f}"
+
+                f" | Episode={history['episode_return'][-1]:8.2f}"
+
+                f" | Actor={np.mean(history['actor_loss'][recent]):8.4f}"
+
+                f" | Critic={np.mean(history['critic_loss'][recent]):8.4f}"
+
+                f" | Entropy={np.mean(history['entropy'][recent]):7.3f}"
+
                 f" | KL={np.mean(history['approx_kl'][recent]):7.4f}"
+
                 f" | Clip={np.mean(history['clip_fraction'][recent]):6.3f}"
+
+                f" | LR={lr:.6f}"
             )
 
     return (
@@ -1397,20 +1733,50 @@ def train():
 
 
 # ============================================================
-# 10. PPO VISUALIZATION
+# 13. TRAINING VISUALIZATION
 # ============================================================
+
+def moving_average(values, window=20):
+
+    values = np.asarray(
+        values,
+        dtype=np.float32,
+    )
+
+    if len(values) < window:
+
+        return values
+
+    return np.convolve(
+        values,
+        np.ones(window) / window,
+        mode="valid",
+    )
+
 
 def plot_training(history):
 
     plots = [
+
         ("reward", "Mean Rollout Reward"),
-        ("distance", "Mean Moving-Target Distance"),
-        ("actor_loss", "PPO Actor Loss"),
+
+        ("episode_return", "Mean Episode Return"),
+
+        ("distance", "Mean Target Distance"),
+
+        ("actor_loss", "Actor Loss"),
+
         ("critic_loss", "Critic Loss"),
+
         ("entropy", "Policy Entropy"),
-        ("approx_kl", "Approximate KL Divergence"),
-        ("clip_fraction", "PPO Clip Fraction"),
-        ("ratio_mean", "Mean Policy Probability Ratio"),
+
+        ("approx_kl", "Approximate KL"),
+
+        ("clip_fraction", "Clip Fraction"),
+
+        ("ratio_mean", "Mean Probability Ratio"),
+
+        ("learning_rate", "Learning Rate"),
     ]
 
     for key, title in plots:
@@ -1419,15 +1785,34 @@ def plot_training(history):
             figsize=(10, 5)
         )
 
+        values = history[key]
+
         plt.plot(
-            history[key]
+            values,
+            alpha=0.3,
+            label="Raw",
         )
+
+        if len(values) >= 20:
+
+            smooth = moving_average(
+                values,
+                20,
+            )
+
+            plt.plot(
+                np.arange(19, len(values)),
+                smooth,
+                label="Moving Average",
+            )
 
         plt.title(title)
 
         plt.xlabel("Training Update")
 
         plt.ylabel(key)
+
+        plt.legend()
 
         plt.grid(True)
 
@@ -1437,23 +1822,26 @@ def plot_training(history):
 
 
 # ============================================================
-# 11. EVALUATION
+# 14. EVALUATION
 # ============================================================
 
-def evaluate(agent, episodes=5):
+def evaluate(agent, episodes=EVAL_EPISODES):
 
     results = []
 
-    for _ in range(episodes):
+    for episode in range(episodes):
 
         env = DroneEnv()
 
         observation = env.reset()
 
         total_reward = 0.0
+
         distances = []
 
         collision = False
+
+        tracking_success_steps = 0
 
         for _ in range(
             MAX_EPISODE_STEPS
@@ -1477,6 +1865,10 @@ def evaluate(agent, episodes=5):
                 info["distance"]
             )
 
+            if info["distance"] < 50.0:
+
+                tracking_success_steps += 1
+
             collision = (
                 collision or info["collision"]
             )
@@ -1485,11 +1877,22 @@ def evaluate(agent, episodes=5):
 
                 break
 
+        tracking_rate = (
+            tracking_success_steps
+            / max(1, len(distances))
+        )
+
         results.append(
             [
                 total_reward,
+
                 float(np.mean(distances)),
+
+                float(np.min(distances)),
+
                 float(collision),
+
+                tracking_rate,
             ]
         )
 
@@ -1498,7 +1901,11 @@ def evaluate(agent, episodes=5):
         dtype=np.float32,
     )
 
-    print("\nEvaluation")
+    print("\n" + "=" * 60)
+
+    print("PPO EVALUATION")
+
+    print("=" * 60)
 
     print(
         "Mean return:",
@@ -1511,15 +1918,55 @@ def evaluate(agent, episodes=5):
     )
 
     print(
-        "Collision rate:",
+        "Best target distance:",
         round(float(results[:, 2].mean()), 3),
     )
+
+    print(
+        "Collision rate:",
+        round(float(results[:, 3].mean()), 3),
+    )
+
+    print(
+        "Tracking success rate:",
+        round(float(results[:, 4].mean() * 100), 2),
+        "%",
+    )
+
+    print("=" * 60)
 
     return results
 
 
 # ============================================================
-# 12. INTERACTIVE PYGAME DRONE
+# 15. SAVE MODEL
+# ============================================================
+
+def save_model(agent):
+
+    torch.save(
+        {
+            "actor_critic": agent.network.state_dict(),
+
+            "optimizer": agent.optimizer.state_dict(),
+
+            "observation_dim": OBS_DIM,
+
+            "action_dim": ACTION_DIM,
+
+            "seed": SEED,
+        },
+
+        "ppo_drone_phase5_7.pth",
+    )
+
+    print(
+        "\nModel saved: ppo_drone_phase5_7.pth"
+    )
+
+
+# ============================================================
+# 16. INTERACTIVE PYGAME
 # ============================================================
 
 def run_pygame(agent):
@@ -1543,7 +1990,7 @@ def run_pygame(agent):
     )
 
     pygame.display.set_caption(
-        "Phase 5.6 — PPO Moving-Target Drone"
+        "Phase 5.7 — Advanced PPO Drone"
     )
 
     clock = pygame.time.Clock()
@@ -1558,31 +2005,14 @@ def run_pygame(agent):
     observation = env.reset()
 
     paused = False
+
     speed = 1
 
     trail = []
 
     total_reward = 0.0
+
     distance = 0.0
-
-    def clamp_center(position):
-
-        return np.array(
-            [
-                np.clip(
-                    position[0],
-                    TARGET_A + 25,
-                    WORLD_W - TARGET_A - 25,
-                ),
-
-                np.clip(
-                    position[1],
-                    TARGET_B + 25,
-                    WORLD_H - TARGET_B - 25,
-                ),
-            ],
-            dtype=np.float32,
-        )
 
     def draw_text(message, x, y):
 
@@ -1607,14 +2037,13 @@ def run_pygame(agent):
 
         if magnitude > 1e-5:
 
-            direction = (
-                velocity / magnitude
-            )
+            direction = velocity / magnitude
 
         else:
 
             direction = np.array(
-                [1.0, 0.0]
+                [1.0, 0.0],
+                dtype=np.float32,
             )
 
         side = np.array(
@@ -1623,8 +2052,6 @@ def run_pygame(agent):
                 direction[0],
             ]
         )
-
-        # Four arms and four propellers.
 
         for forward in (-1, 1):
 
@@ -1657,15 +2084,6 @@ def run_pygame(agent):
             (245, 245, 245),
             center.astype(int),
             8,
-        )
-
-        pygame.draw.circle(
-            screen,
-            (255, 190, 60),
-            (
-                center + direction * 22
-            ).astype(int),
-            4,
         )
 
         pygame.draw.line(
@@ -1705,23 +2123,11 @@ def run_pygame(agent):
 
         position = env.target.position()
 
-        velocity = env.target.velocity()
-
         pygame.draw.circle(
             screen,
             (65, 240, 105),
             position.astype(int),
             11,
-        )
-
-        pygame.draw.line(
-            screen,
-            (65, 255, 115),
-            position.astype(int),
-            (
-                position + velocity * 0.18
-            ).astype(int),
-            3,
         )
 
     running = True
@@ -1771,17 +2177,6 @@ def run_pygame(agent):
                         speed - 1,
                     )
 
-            elif event.type == pygame.MOUSEBUTTONDOWN:
-
-                if event.button == 1:
-
-                    env.target.center = clamp_center(
-                        np.array(
-                            event.pos,
-                            dtype=np.float32,
-                        )
-                    )
-
         if not paused:
 
             for _ in range(speed):
@@ -1806,7 +2201,7 @@ def run_pygame(agent):
                     env.state[:2].copy()
                 )
 
-                if len(trail) > 250:
+                if len(trail) > 300:
 
                     trail.pop(0)
 
@@ -1821,6 +2216,8 @@ def run_pygame(agent):
         screen.fill(
             (17, 23, 34)
         )
+
+        # Background grid.
 
         for x in range(
             0,
@@ -1848,6 +2245,8 @@ def run_pygame(agent):
                 (WORLD_W, y),
             )
 
+        # Obstacle and safety zone.
+
         pygame.draw.circle(
             screen,
             (100, 100, 110),
@@ -1865,6 +2264,8 @@ def run_pygame(agent):
 
         draw_target()
 
+        # Drone trajectory.
+
         if len(trail) > 1:
 
             pygame.draw.lines(
@@ -1881,7 +2282,7 @@ def run_pygame(agent):
         draw_drone()
 
         draw_text(
-            "PHASE 5.6 — PROXIMAL POLICY OPTIMIZATION",
+            "PHASE 5.7 — ADVANCED PPO",
             15,
             12,
         )
@@ -1905,15 +2306,9 @@ def run_pygame(agent):
         )
 
         draw_text(
-            "Click: change moving-target trajectory center",
-            15,
-            WORLD_H - 100,
-        )
-
-        draw_text(
             "SPACE pause | R reset | +/- speed | ESC exit",
             15,
-            WORLD_H - 70,
+            WORLD_H - 45,
         )
 
         if paused:
@@ -1930,7 +2325,7 @@ def run_pygame(agent):
 
 
 # ============================================================
-# 13. NUMERICAL VERIFICATION
+# 17. NUMERICAL VERIFICATION
 # ============================================================
 
 def run_tests():
@@ -1953,18 +2348,16 @@ def run_tests():
             f"[PASS] {description}"
         )
 
-    # Test 1:
-    # Probability ratio equals one when old and new
-    # log probabilities are identical.
+    # Test 1: Probability ratio.
 
-    old_log_prob = torch.tensor(
+    old = torch.tensor(
         [-1.0, -2.0]
     )
 
-    new_log_prob = old_log_prob.clone()
+    new = old.clone()
 
     ratio = torch.exp(
-        new_log_prob - old_log_prob
+        new - old
     )
 
     check(
@@ -1972,11 +2365,10 @@ def run_tests():
             ratio,
             torch.ones_like(ratio),
         ),
-        "Identical policies produce ratio one",
+        "Unchanged policy ratio",
     )
 
-    # Test 2:
-    # Clipping limits probability ratio.
+    # Test 2: PPO clipping.
 
     ratio = torch.tensor(
         [0.5, 1.0, 1.5]
@@ -1995,32 +2387,19 @@ def run_tests():
                 [0.8, 1.0, 1.2]
             ),
         ),
-        "PPO probability ratio clipping",
+        "PPO clipping",
     )
 
-    # Test 3:
-    # Positive advantage: ratio above upper bound
-    # cannot improve the clipped objective.
-
-    advantage = torch.tensor(
-        [2.0]
-    )
-
-    ratio = torch.tensor(
-        [1.5]
-    )
-
-    surrogate_1 = ratio * advantage
-
-    surrogate_2 = torch.clamp(
-        ratio,
-        0.8,
-        1.2,
-    ) * advantage
+    # Test 3: Positive advantage.
 
     objective = torch.minimum(
-        surrogate_1,
-        surrogate_2,
+        torch.tensor([1.5]) * 2.0,
+
+        torch.clamp(
+            torch.tensor([1.5]),
+            0.8,
+            1.2,
+        ) * 2.0,
     )
 
     check(
@@ -2028,28 +2407,19 @@ def run_tests():
             objective,
             torch.tensor([2.4]),
         ),
-        "Positive advantage uses conservative upper clipping",
+        "Positive advantage clipping",
     )
 
-    # Test 4:
-    # Negative advantage: ratio below lower bound
-    # cannot improve the clipped objective.
-
-    advantage = torch.tensor(
-        [-2.0]
-    )
-
-    ratio = torch.tensor(
-        [0.5]
-    )
+    # Test 4: Negative advantage.
 
     objective = torch.minimum(
-        ratio * advantage,
+        torch.tensor([0.5]) * -2.0,
+
         torch.clamp(
-            ratio,
+            torch.tensor([0.5]),
             0.8,
             1.2,
-        ) * advantage,
+        ) * -2.0,
     )
 
     check(
@@ -2057,20 +2427,23 @@ def run_tests():
             objective,
             torch.tensor([-1.6]),
         ),
-        "Negative advantage uses conservative lower clipping",
+        "Negative advantage clipping",
     )
 
-    # Test 5:
-    # Terminal transition suppresses bootstrap.
+    # Test 5: Terminal bootstrap.
 
     advantages, _ = compute_gae(
         np.array([[1.0]], dtype=np.float32),
+
         np.array([[0.5]], dtype=np.float32),
+
         np.array([[100.0]], dtype=np.float32),
+
         np.array([[1.0]], dtype=np.float32),
+
         np.array([[0.0]], dtype=np.float32),
+
         gamma=0.9,
-        gae_lambda=0.95,
     )
 
     check(
@@ -2078,20 +2451,23 @@ def run_tests():
             advantages[0, 0],
             0.5,
         ),
-        "Terminal transition suppresses bootstrap",
+        "Terminal bootstrap suppression",
     )
 
-    # Test 6:
-    # Truncation bootstraps from final observation.
+    # Test 6: Truncation bootstrap.
 
     advantages, _ = compute_gae(
         np.array([[1.0]], dtype=np.float32),
+
         np.array([[0.5]], dtype=np.float32),
+
         np.array([[2.0]], dtype=np.float32),
+
         np.array([[0.0]], dtype=np.float32),
+
         np.array([[1.0]], dtype=np.float32),
+
         gamma=0.9,
-        gae_lambda=0.95,
     )
 
     check(
@@ -2099,25 +2475,39 @@ def run_tests():
             advantages[0, 0],
             2.3,
         ),
-        "Truncation preserves value bootstrap",
+        "Truncation bootstrap",
     )
 
-    # Test 7:
-    # GAE recursion stops at truncation.
+    # Test 7: GAE recursion boundary.
 
     advantages, _ = compute_gae(
         np.array(
             [[1.0], [100.0]],
             dtype=np.float32,
         ),
-        np.zeros((2, 1), dtype=np.float32),
-        np.zeros((2, 1), dtype=np.float32),
-        np.zeros((2, 1), dtype=np.float32),
+
+        np.zeros(
+            (2, 1),
+            dtype=np.float32,
+        ),
+
+        np.zeros(
+            (2, 1),
+            dtype=np.float32,
+        ),
+
+        np.zeros(
+            (2, 1),
+            dtype=np.float32,
+        ),
+
         np.array(
             [[1.0], [0.0]],
             dtype=np.float32,
         ),
+
         gamma=1.0,
+
         gae_lambda=1.0,
     )
 
@@ -2126,11 +2516,10 @@ def run_tests():
             advantages[0, 0],
             1.0,
         ),
-        "GAE recursion stops at truncation",
+        "GAE truncation boundary",
     )
 
-    # Test 8:
-    # Tanh actions stay bounded.
+    # Test 8: Tanh action bounds.
 
     raw = torch.randn(
         (100, ACTION_DIM)
@@ -2144,33 +2533,40 @@ def run_tests():
                 bounded.abs() <= 1.0
             )
         ),
-        "Tanh action bounds",
+        "Bounded actions",
     )
 
-    # Test 9:
-    # Network dimensions.
+    # Test 9: Actor dimensions.
 
-    network = ActorCritic().to(
-        DEVICE
-    )
+    actor = Actor().to(DEVICE)
 
     states = torch.zeros(
         (4, OBS_DIM),
-        dtype=torch.float32,
         device=DEVICE,
     )
 
-    mean, log_std, values = network(states)
+    mean, log_std = actor(states)
 
     check(
         mean.shape == (4, ACTION_DIM)
-        and log_std.shape == (ACTION_DIM,)
-        and values.shape == (4,),
-        "Actor-critic output dimensions",
+        and log_std.shape == (ACTION_DIM,),
+        "Actor dimensions",
     )
 
-    # Test 10:
-    # Sampled log probability is finite.
+    # Test 10: Critic dimensions.
+
+    critic = Critic().to(DEVICE)
+
+    values = critic(states)
+
+    check(
+        values.shape == (4,),
+        "Critic dimensions",
+    )
+
+    # Test 11: Finite probabilities.
+
+    network = ActorCritic().to(DEVICE)
 
     (
         actions,
@@ -2183,15 +2579,13 @@ def run_tests():
         bool(
             torch.isfinite(log_probs).all()
         ),
-        "Sampled log probabilities are finite",
+        "Finite log probabilities",
     )
 
-    # Test 11:
-    # Stored and reevaluated log probabilities agree
-    # before any network parameter update.
+    # Test 12: Old/new log probability agreement.
 
-    reevaluated, entropy, values = (
-        network.evaluate_actions(
+    new_log_probs, entropy = (
+        network.actor.evaluate_actions(
             states,
             raw_actions,
         )
@@ -2200,24 +2594,22 @@ def run_tests():
     check(
         torch.allclose(
             log_probs,
-            reevaluated,
+            new_log_probs,
             atol=1e-5,
         ),
-        "Old and new log probabilities initially agree",
+        "Old/new log probability agreement",
     )
 
-    # Test 12:
-    # Entropy is finite.
+    # Test 13: Finite entropy.
 
     check(
         bool(
             torch.isfinite(entropy).all()
         ),
-        "Policy entropy is finite",
+        "Finite policy entropy",
     )
 
-    # Test 13:
-    # Environment returns correct API.
+    # Test 14: Environment API.
 
     env = DroneEnv()
 
@@ -2230,23 +2622,17 @@ def run_tests():
 
     check(
         len(result) == 5,
-        "Environment step API",
+        "Environment API",
     )
 
-    # Test 14:
-    # Moving target velocity has two dimensions.
-
-    target = MovingTarget(
-        [400.0, 300.0]
-    )
+    # Test 15: Observation dimensions.
 
     check(
-        target.velocity().shape == (2,),
-        "Moving target velocity representation",
+        env.observation().shape == (OBS_DIM,),
+        "Observation dimensions",
     )
 
-    # Test 15:
-    # Parallel environment returns final observations.
+    # Test 16: Parallel environments.
 
     envs = ParallelEnvironments(3)
 
@@ -2263,92 +2649,21 @@ def run_tests():
         obs.shape == (3, OBS_DIM)
         and output[0].shape == (3, OBS_DIM)
         and output[1].shape == (3, OBS_DIM),
-        "Parallel environment observation dimensions",
+        "Parallel environment dimensions",
     )
 
-    # Test 16:
-    # PPO ratio is one when the policy is unchanged.
+    # Test 17: Target velocity.
 
-    old = torch.tensor(
-        [-1.0, -0.5, -2.0]
-    )
-
-    new = old.clone()
-
-    ratio = torch.exp(
-        new - old
+    target = MovingTarget(
+        [400.0, 300.0]
     )
 
     check(
-        torch.allclose(
-            ratio,
-            torch.ones_like(ratio),
-        ),
-        "Unchanged policy ratio",
+        target.velocity().shape == (2,),
+        "Target velocity",
     )
 
-    # Test 17:
-    # PPO actor-critic optimizer update.
-
-    optimizer = optim.Adam(
-        network.parameters(),
-        lr=1e-4,
-    )
-
-    advantages = torch.ones(
-        4,
-        device=DEVICE,
-    )
-
-    returns = torch.ones(
-        4,
-        device=DEVICE,
-    )
-
-    log_probs, entropy, values = (
-        network.evaluate_actions(
-            states,
-            raw_actions,
-        )
-    )
-
-    ratio = torch.exp(
-        log_probs - log_probs.detach()
-    )
-
-    surrogate = torch.minimum(
-        ratio * advantages,
-        torch.clamp(
-            ratio,
-            0.8,
-            1.2,
-        ) * advantages,
-    )
-
-    loss = (
-        -surrogate.mean()
-        + VALUE_COEF
-        * 0.5
-        * (values - returns).pow(2).mean()
-        - ENTROPY_COEF
-        * entropy.mean()
-    )
-
-    optimizer.zero_grad()
-
-    loss.backward()
-
-    optimizer.step()
-
-    check(
-        bool(
-            torch.isfinite(loss)
-        ),
-        "PPO optimizer update",
-    )
-
-    # Test 18:
-    # No NaN in a multi-step GAE rollout.
+    # Test 18: GAE numerical stability.
 
     rewards = np.random.randn(
         10,
@@ -2386,18 +2701,67 @@ def run_tests():
     check(
         np.isfinite(advantages).all()
         and np.isfinite(returns).all(),
-        "GAE rollout remains numerically finite",
+        "GAE numerical stability",
+    )
+
+    # Test 19: Optimizer.
+
+    optimizer = optim.Adam(
+        network.parameters(),
+        lr=1e-4,
+    )
+
+    (
+        log_probs,
+        entropy,
+        values,
+    ) = network.evaluate_actions(
+        states,
+        raw_actions,
+    )
+
+    loss = (
+        -log_probs.mean()
+        + 0.5 * values.pow(2).mean()
+        - ENTROPY_COEF * entropy.mean()
+    )
+
+    optimizer.zero_grad()
+
+    loss.backward()
+
+    optimizer.step()
+
+    check(
+        bool(
+            torch.isfinite(loss)
+        ),
+        "Actor-critic optimizer update",
+    )
+
+    # Test 20: Deterministic actions.
+
+    deterministic = (
+        network.deterministic_action(states)
+    )
+
+    check(
+        deterministic.shape == (4, ACTION_DIM)
+        and bool(
+            torch.isfinite(deterministic).all()
+        ),
+        "Deterministic policy",
     )
 
     print(
-        f"\n{passed}/18 tests passed."
+        f"\n{passed}/20 tests passed."
     )
 
-    return passed == 18
+    return passed == 20
 
 
 # ============================================================
-# 14. MAIN
+# 18. MAIN
 # ============================================================
 
 def main():
@@ -2405,7 +2769,7 @@ def main():
     print("=" * 72)
 
     print(
-        "PHASE 5.6 — PROXIMAL POLICY OPTIMIZATION"
+        "PHASE 5.7 — ADVANCED PPO"
     )
 
     print("=" * 72)
@@ -2423,6 +2787,10 @@ def main():
     )
 
     print(
+        f"Rollout batch: {NUM_ENVS * ROLLOUT_STEPS}"
+    )
+
+    print(
         f"PPO epochs: {PPO_EPOCHS}"
     )
 
@@ -2431,7 +2799,19 @@ def main():
     )
 
     print(
+        f"Training updates: {TRAIN_UPDATES}"
+    )
+
+    print(
+        f"Learning rate: {LEARNING_RATE}"
+    )
+
+    print(
         f"Clip epsilon: {CLIP_EPSILON}"
+    )
+
+    print(
+        f"Target KL: {TARGET_KL}"
     )
 
     if not run_tests():
@@ -2441,31 +2821,40 @@ def main():
         )
 
     print(
-        "\n[1/4] Training PPO..."
+        "\n[1/5] Training PPO..."
     )
 
     agent, history, episode_returns = train()
 
     print(
-        "\n[2/4] Evaluating PPO..."
+        "\n[2/5] Evaluating PPO..."
     )
 
-    evaluate(agent)
+    evaluation_results = evaluate(
+        agent,
+        EVAL_EPISODES,
+    )
 
     print(
-        "\n[3/4] Plotting training diagnostics..."
+        "\n[3/5] Saving model..."
+    )
+
+    save_model(agent)
+
+    print(
+        "\n[4/5] Plotting training diagnostics..."
     )
 
     plot_training(history)
 
     print(
-        "\n[4/4] Starting interactive quadcopter..."
+        "\n[5/5] Starting interactive simulation..."
     )
 
     run_pygame(agent)
 
     print(
-        "\nPhase 5.6 completed."
+        "\nPhase 5.7 completed."
     )
 
 

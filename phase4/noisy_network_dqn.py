@@ -1,77 +1,44 @@
-
 # ============================================================
-# File: phase4/noisy_network_dqn.py
+# File: phase4/_noisy_network_dqn.py
 #
 # PHASE 4.6 — NOISY NETWORKS FOR DEEP RL
 #
-# PURPOSE
-#   Replace epsilon-greedy exploration with learnable
-#   parameter-space noise.
+# COMPLETE CORRECTED VERSION
 #
-# WHAT YOU LEARN
+# FIXES:
+#   1. Prevents in-place modification of noise buffers from
+#      invalidating the autograd graph.
+#   2. Uses consistent online-network noise for current Q and
+#      next-action selection.
+#   3. Keeps target network in training mode during learning.
+#   4. Uses deterministic mean parameters during evaluation.
+#   5. Handles invalid/non-finite replay priorities.
+#   6. Removes invalid global WARMUP_STEPS declaration.
+#   7. Makes warm-up configurable per train_step call.
+#   8. Includes a backward-pass regression test.
+#   9. Includes checkpoint loading and CLI options.
 #
-# STEP 1 — NOISY LINEAR LAYER
-#   y = (W + sigma_W * epsilon_W)x
-#       + (b + sigma_b * epsilon_b)
-#
-# STEP 2 — FACTORIZED GAUSSIAN NOISE
-#   f(x) = sign(x) * sqrt(|x|)
-#
-#   epsilon_W[i,j] = f(epsilon_i) * f(epsilon_j)
-#
-# STEP 3 — LEARNABLE NOISE SCALE
-#   sigma_W and sigma_b are trainable parameters.
-#
-# STEP 4 — DUELING NOISY DQN
-#   Q(s,a) = V(s) + A(s,a) - mean(A(s,a))
-#
-# STEP 5 — DOUBLE DQN
-#   Online network selects next action.
-#   Target network evaluates selected action.
-#
-# STEP 6 — PRIORITIZED EXPERIENCE REPLAY
-#   Sample transitions according to TD-error priorities.
-#
-# STEP 7 — NOISY EXPLORATION
-#   Remove epsilon-greedy randomness.
-#   Reset network noise to generate exploratory behavior.
-#
-# STEP 8 — VISUALIZATION
-#   Interactive Pygame rocket navigation.
-#
-# ROBOTICS APPLICATION
-#   A mobile robot often encounters unfamiliar situations.
-#   Parameter-space noise can encourage coherent exploratory
-#   behavior rather than independently random actions at
-#   every time step.
-#
-# IMPORTANT
-#   Noisy Networks do not guarantee safe exploration.
-#   The geometric safety filter in this demonstration is
-#   separate from the learned policy.
-#
-# PYGAME CONTROLS
-#   Left click : Set target
-#   SPACE      : Pause / resume
-#   R          : Reset rocket
-#   + / -      : Simulation speed
-#   N          : Reset network noise
-#   ESC        : Exit
-#
-# LEARNING CYCLE
-#   Understand -> Implement -> Visualize -> Verify
-#       -> Experiment -> Apply
-#
-# INSTALL
+# INSTALL:
 #   pip install numpy pygame torch
 #
-# RUN
-#   python phase4/noisy_network_dqn.py
+# RUN:
+#   python _noisy_network_dqn.py
+#
+# QUICK TEST:
+#   python _noisy_network_dqn.py --test-only
+#
+# FAST TRAINING:
+#   python _noisy_network_dqn.py --fast
+#
+# WITHOUT PYGAME:
+#   python _noisy_network_dqn.py --no-pygame
 # ============================================================
 
 from __future__ import annotations
 
+import argparse
 import math
+import os
 import random
 from dataclasses import dataclass
 
@@ -94,19 +61,27 @@ WORLD_HEIGHT = 560
 WINDOW_WIDTH = 1020
 WINDOW_HEIGHT = 650
 
-OBSTACLE = np.array([350.0, 280.0], dtype=np.float32)
+OBSTACLE = np.array(
+    [350.0, 280.0],
+    dtype=np.float32,
+)
+
 OBSTACLE_RADIUS = 55.0
 
 ROCKET_RADIUS = 11.0
 SAFETY_MARGIN = 20.0
-SAFE_DISTANCE = OBSTACLE_RADIUS + ROCKET_RADIUS + SAFETY_MARGIN
+
+SAFE_DISTANCE = (
+    OBSTACLE_RADIUS
+    + ROCKET_RADIUS
+    + SAFETY_MARGIN
+)
 
 MOVE_STEP = 8.0
 MAX_EPISODE_STEPS = 170
 
 STATE_SIZE = 10
 NUM_ACTIONS = 9
-
 HIDDEN_SIZE = 128
 
 GAMMA = 0.98
@@ -119,15 +94,15 @@ WARMUP_STEPS = 800
 TRAIN_EPISODES = 350
 TARGET_UPDATE_INTERVAL = 300
 
-# Noisy Network parameters.
 NOISE_SIGMA = 0.5
 
-# PER parameters.
 PER_ALPHA = 0.6
 PER_BETA_START = 0.4
 PER_BETA_END = 1.0
 PER_BETA_STEPS = 50_000
 PER_EPSILON = 1e-5
+
+CHECKPOINT_PATH = "noisy_dqn.pth"
 
 DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
@@ -149,7 +124,9 @@ ACTION_VECTORS = np.array(
 )
 
 for i in range(8):
-    ACTION_VECTORS[i] /= np.linalg.norm(ACTION_VECTORS[i])
+    ACTION_VECTORS[i] /= np.linalg.norm(
+        ACTION_VECTORS[i]
+    )
 
 ACTION_NAMES = [
     "RIGHT",
@@ -187,8 +164,10 @@ def distance(a, b):
 
 def is_inside_world(position):
     return (
-        ROCKET_RADIUS <= position[0] <= WORLD_WIDTH - ROCKET_RADIUS
-        and ROCKET_RADIUS <= position[1] <= WORLD_HEIGHT - ROCKET_RADIUS
+        ROCKET_RADIUS <= position[0]
+        <= WORLD_WIDTH - ROCKET_RADIUS
+        and ROCKET_RADIUS <= position[1]
+        <= WORLD_HEIGHT - ROCKET_RADIUS
     )
 
 
@@ -197,14 +176,23 @@ def is_safe_position(position):
 
 
 def candidate_position(position, action):
-    return position + ACTION_VECTORS[action] * MOVE_STEP
+    return (
+        position
+        + ACTION_VECTORS[action] * MOVE_STEP
+    )
 
 
 def calculate_action_mask(position):
-    mask = np.zeros(NUM_ACTIONS, dtype=bool)
+    mask = np.zeros(
+        NUM_ACTIONS,
+        dtype=bool,
+    )
 
     for action in range(8):
-        next_position = candidate_position(position, action)
+        next_position = candidate_position(
+            position,
+            action,
+        )
 
         mask[action] = (
             is_inside_world(next_position)
@@ -218,7 +206,7 @@ def calculate_action_mask(position):
 
 def random_valid_position():
     for _ in range(10_000):
-        p = np.array(
+        position = np.array(
             [
                 random.uniform(35, WORLD_WIDTH - 35),
                 random.uniform(35, WORLD_HEIGHT - 35),
@@ -226,10 +214,12 @@ def random_valid_position():
             dtype=np.float32,
         )
 
-        if is_safe_position(p):
-            return p
+        if is_safe_position(position):
+            return position
 
-    raise RuntimeError("Could not generate safe position.")
+    raise RuntimeError(
+        "Could not generate safe position."
+    )
 
 
 # ============================================================
@@ -266,20 +256,35 @@ class RocketNavigationEnv:
         self.collision = False
 
     def set_scenario(self, start, target):
-        start = np.array(start, dtype=np.float32)
-        target = np.array(target, dtype=np.float32)
+        start = np.asarray(
+            start,
+            dtype=np.float32,
+        )
+
+        target = np.asarray(
+            target,
+            dtype=np.float32,
+        )
 
         if not is_inside_world(start):
-            raise ValueError("Invalid start position.")
+            raise ValueError(
+                "Invalid start position."
+            )
 
         if not is_inside_world(target):
-            raise ValueError("Invalid target position.")
+            raise ValueError(
+                "Invalid target position."
+            )
 
         if not is_safe_position(start):
-            raise ValueError("Start violates safety distance.")
+            raise ValueError(
+                "Start violates safety distance."
+            )
 
         if not is_safe_position(target):
-            raise ValueError("Target violates safety distance.")
+            raise ValueError(
+                "Target violates safety distance."
+            )
 
         self.position = start.copy()
         self.target = target.copy()
@@ -297,37 +302,61 @@ class RocketNavigationEnv:
         start = random_valid_position()
         target = random_valid_position()
 
+        attempts = 0
+
         while distance(start, target) < 250:
             target = random_valid_position()
+            attempts += 1
 
-        return self.set_scenario(start, target)
+            if attempts > 10_000:
+                raise RuntimeError(
+                    "Could not generate separated start and target."
+                )
+
+        return self.set_scenario(
+            start,
+            target,
+        )
 
     def get_state(self):
-        target_delta = self.target - self.position
-        obstacle_delta = OBSTACLE - self.position
+        target_delta = (
+            self.target - self.position
+        )
 
-        target_distance = np.linalg.norm(target_delta)
-        obstacle_distance = np.linalg.norm(obstacle_delta)
+        obstacle_delta = (
+            OBSTACLE - self.position
+        )
 
-        clearance = obstacle_distance - SAFE_DISTANCE
+        target_distance = np.linalg.norm(
+            target_delta
+        )
 
-        previous_vector = ACTION_VECTORS[self.previous_action]
+        obstacle_distance = np.linalg.norm(
+            obstacle_delta
+        )
+
+        clearance = (
+            obstacle_distance - SAFE_DISTANCE
+        )
+
+        previous_vector = ACTION_VECTORS[
+            self.previous_action
+        ]
+
+        diagonal = math.hypot(
+            WORLD_WIDTH,
+            WORLD_HEIGHT,
+        )
 
         return np.array(
             [
                 target_delta[0] / WORLD_WIDTH,
                 target_delta[1] / WORLD_HEIGHT,
-                target_distance / math.hypot(
-                    WORLD_WIDTH,
-                    WORLD_HEIGHT,
-                ),
+                target_distance / diagonal,
 
                 obstacle_delta[0] / WORLD_WIDTH,
                 obstacle_delta[1] / WORLD_HEIGHT,
-                clearance / math.hypot(
-                    WORLD_WIDTH,
-                    WORLD_HEIGHT,
-                ),
+                clearance / diagonal,
 
                 self.position[0] / WORLD_WIDTH,
                 self.position[1] / WORLD_HEIGHT,
@@ -339,11 +368,15 @@ class RocketNavigationEnv:
         )
 
     def action_mask(self):
-        return calculate_action_mask(self.position)
+        return calculate_action_mask(
+            self.position
+        )
 
     def step(self, action):
         if not 0 <= action < NUM_ACTIONS:
-            raise ValueError("Invalid action.")
+            raise ValueError(
+                "Invalid action."
+            )
 
         old_distance = distance(
             self.position,
@@ -381,14 +414,19 @@ class RocketNavigationEnv:
                 old_distance - new_distance
             )
 
-            old_vector = ACTION_VECTORS[self.previous_action]
+            old_vector = ACTION_VECTORS[
+                self.previous_action
+            ]
+
             new_vector = ACTION_VECTORS[action]
 
-            # Penalize unnecessary direct reversals.
             if (
                 self.previous_action != 8
                 and action != 8
-                and np.dot(old_vector, new_vector) < -0.5
+                and np.dot(
+                    old_vector,
+                    new_vector,
+                ) < -0.5
             ):
                 reward -= 0.08
 
@@ -401,7 +439,10 @@ class RocketNavigationEnv:
 
         self.steps += 1
 
-        if self.steps >= MAX_EPISODE_STEPS and not terminated:
+        if (
+            self.steps >= MAX_EPISODE_STEPS
+            and not terminated
+        ):
             truncated = True
 
         self.total_reward += reward
@@ -430,22 +471,9 @@ class NoisyLinear(nn.Module):
     """
     Factorized Gaussian Noisy Linear Layer.
 
-    Standard linear layer:
-        y = Wx + b
-
-    Noisy linear layer:
-        y = (W + sigma_W * epsilon_W)x
-            + (b + sigma_b * epsilon_b)
-
-    sigma parameters are learned by gradient descent.
-
-    Factorized noise:
-        f(x) = sign(x) * sqrt(|x|)
-
-        epsilon_W[i,j] = f(epsilon_out[i])
-                         * f(epsilon_in[j])
-
-    This reduces the cost of sampling a full noise matrix.
+    The epsilon buffers are cloned during forward().
+    This protects tensors saved for backward() from later
+    modifications caused by reset_noise().
     """
 
     def __init__(
@@ -460,11 +488,17 @@ class NoisyLinear(nn.Module):
         self.out_features = out_features
 
         self.weight_mu = nn.Parameter(
-            torch.empty(out_features, in_features)
+            torch.empty(
+                out_features,
+                in_features,
+            )
         )
 
         self.weight_sigma = nn.Parameter(
-            torch.empty(out_features, in_features)
+            torch.empty(
+                out_features,
+                in_features,
+            )
         )
 
         self.bias_mu = nn.Parameter(
@@ -477,7 +511,10 @@ class NoisyLinear(nn.Module):
 
         self.register_buffer(
             "weight_epsilon",
-            torch.empty(out_features, in_features),
+            torch.empty(
+                out_features,
+                in_features,
+            ),
         )
 
         self.register_buffer(
@@ -489,7 +526,9 @@ class NoisyLinear(nn.Module):
         self.reset_noise()
 
     def reset_parameters(self, sigma_init):
-        bound = 1.0 / math.sqrt(self.in_features)
+        bound = 1.0 / math.sqrt(
+            self.in_features
+        )
 
         nn.init.uniform_(
             self.weight_mu,
@@ -505,12 +544,16 @@ class NoisyLinear(nn.Module):
 
         nn.init.constant_(
             self.weight_sigma,
-            sigma_init / math.sqrt(self.in_features),
+            sigma_init / math.sqrt(
+                self.in_features
+            ),
         )
 
         nn.init.constant_(
             self.bias_sigma,
-            sigma_init / math.sqrt(self.out_features),
+            sigma_init / math.sqrt(
+                self.out_features
+            ),
         )
 
     @staticmethod
@@ -520,8 +563,12 @@ class NoisyLinear(nn.Module):
             device=device,
         )
 
-        return x.sign() * x.abs().sqrt()
+        return (
+            x.sign()
+            * x.abs().sqrt()
+        )
 
+    @torch.no_grad()
     def reset_noise(self):
         epsilon_in = self.scale_noise(
             self.in_features,
@@ -537,22 +584,32 @@ class NoisyLinear(nn.Module):
             epsilon_out.outer(epsilon_in)
         )
 
-        self.bias_epsilon.copy_(epsilon_out)
+        self.bias_epsilon.copy_(
+            epsilon_out
+        )
 
     def forward(self, x):
         if self.training:
+            # Clone buffers to protect the autograd graph.
+            weight_epsilon = (
+                self.weight_epsilon.clone()
+            )
+
+            bias_epsilon = (
+                self.bias_epsilon.clone()
+            )
+
             weight = (
                 self.weight_mu
-                + self.weight_sigma * self.weight_epsilon
+                + self.weight_sigma * weight_epsilon
             )
 
             bias = (
                 self.bias_mu
-                + self.bias_sigma * self.bias_epsilon
+                + self.bias_sigma * bias_epsilon
             )
 
         else:
-            # Deterministic evaluation uses mean parameters.
             weight = self.weight_mu
             bias = self.bias_mu
 
@@ -573,7 +630,10 @@ class NoisyDuelingDQN(nn.Module):
         super().__init__()
 
         self.feature_layer = nn.Sequential(
-            nn.Linear(STATE_SIZE, HIDDEN_SIZE),
+            nn.Linear(
+                STATE_SIZE,
+                HIDDEN_SIZE,
+            ),
             nn.ReLU(),
         )
 
@@ -598,9 +658,13 @@ class NoisyDuelingDQN(nn.Module):
         return (
             value
             + advantage
-            - advantage.mean(dim=1, keepdim=True)
+            - advantage.mean(
+                dim=1,
+                keepdim=True,
+            )
         )
 
+    @torch.no_grad()
     def reset_noise(self):
         for module in self.modules():
             if isinstance(module, NoisyLinear):
@@ -632,6 +696,7 @@ class PrioritizedReplayBuffer:
         self.alpha = alpha
 
         self.memory = []
+
         self.priorities = np.zeros(
             capacity,
             dtype=np.float32,
@@ -646,7 +711,9 @@ class PrioritizedReplayBuffer:
         else:
             self.memory[self.position] = transition
 
-        self.priorities[self.position] = self.max_priority
+        self.priorities[self.position] = (
+            self.max_priority
+        )
 
         self.position = (
             self.position + 1
@@ -656,16 +723,31 @@ class PrioritizedReplayBuffer:
         size = len(self.memory)
 
         if size == 0:
-            raise ValueError("Replay buffer is empty.")
+            raise ValueError(
+                "Replay buffer is empty."
+            )
 
-        scaled = (
-            self.priorities[:size] ** self.alpha
+        priorities = self.priorities[
+            :size
+        ].astype(np.float64)
+
+        priorities = np.maximum(
+            priorities,
+            PER_EPSILON,
         )
 
+        scaled = priorities ** self.alpha
         total = float(np.sum(scaled))
 
-        if not np.isfinite(total) or total <= 0:
-            return np.full(size, 1.0 / size)
+        if (
+            not np.isfinite(total)
+            or total <= 0
+        ):
+            return np.full(
+                size,
+                1.0 / size,
+                dtype=np.float64,
+            )
 
         return scaled / total
 
@@ -673,7 +755,9 @@ class PrioritizedReplayBuffer:
         size = len(self.memory)
 
         if size < batch_size:
-            raise ValueError("Insufficient replay samples.")
+            raise ValueError(
+                "Insufficient replay samples."
+            )
 
         probabilities = self.probabilities()
 
@@ -684,18 +768,28 @@ class PrioritizedReplayBuffer:
             p=probabilities,
         )
 
-        selected_probabilities = probabilities[indices]
+        selected_probabilities = (
+            probabilities[indices]
+        )
 
         weights = (
             size * selected_probabilities
         ) ** (-beta)
 
-        weights /= weights.max()
+        weights /= max(
+            float(weights.max()),
+            1e-12,
+        )
 
-        batch = [self.memory[i] for i in indices]
+        batch = [
+            self.memory[int(i)]
+            for i in indices
+        ]
 
         return (
-            np.stack([t.state for t in batch]),
+            np.stack(
+                [t.state for t in batch]
+            ),
             np.array(
                 [t.action for t in batch],
                 dtype=np.int64,
@@ -704,24 +798,38 @@ class PrioritizedReplayBuffer:
                 [t.reward for t in batch],
                 dtype=np.float32,
             ),
-            np.stack([t.next_state for t in batch]),
+            np.stack(
+                [t.next_state for t in batch]
+            ),
             np.array(
                 [t.terminated for t in batch],
                 dtype=np.float32,
             ),
-            np.stack([t.next_mask for t in batch]),
+            np.stack(
+                [t.next_mask for t in batch]
+            ),
             indices,
             weights.astype(np.float32),
         )
 
-    def update_priorities(self, indices, td_errors):
-        for index, error in zip(indices, td_errors):
-            priority = abs(float(error)) + PER_EPSILON
+    def update_priorities(
+        self,
+        indices,
+        td_errors,
+    ):
+        for index, error in zip(
+            indices,
+            td_errors,
+        ):
+            priority = (
+                abs(float(error))
+                + PER_EPSILON
+            )
 
             if not np.isfinite(priority):
                 priority = self.max_priority
 
-            self.priorities[index] = priority
+            self.priorities[int(index)] = priority
 
             self.max_priority = max(
                 self.max_priority,
@@ -736,7 +844,11 @@ class PrioritizedReplayBuffer:
             return 0.0
 
         return float(
-            np.mean(self.priorities[:len(self.memory)])
+            np.mean(
+                self.priorities[
+                    :len(self.memory)
+                ]
+            )
         )
 
 
@@ -772,7 +884,8 @@ class NoisyDQNAgent:
             self.policy_net.state_dict()
         )
 
-        self.target_net.eval()
+        self.policy_net.train()
+        self.target_net.train()
 
         self.optimizer = optim.Adam(
             self.policy_net.parameters(),
@@ -780,32 +893,40 @@ class NoisyDQNAgent:
         )
 
         self.replay_buffer = PrioritizedReplayBuffer(
-            REPLAY_CAPACITY,
+            REPLAY_CAPACITY
         )
 
         self.training_steps = 0
         self.loss_history = []
         self.td_error_history = []
 
+    @torch.no_grad()
     def reset_noise(self):
         self.policy_net.reset_noise()
         self.target_net.reset_noise()
 
+    @torch.no_grad()
     def predict(self, state):
+        was_training = self.policy_net.training
+
         self.policy_net.eval()
 
-        with torch.no_grad():
-            state_t = torch.as_tensor(
-                state,
-                dtype=torch.float32,
-                device=DEVICE,
-            ).unsqueeze(0)
+        state_t = torch.as_tensor(
+            state,
+            dtype=torch.float32,
+            device=DEVICE,
+        ).unsqueeze(0)
 
-            q_values = self.policy_net(state_t)
+        q_values = self.policy_net(state_t)
 
-        self.policy_net.train()
+        if was_training:
+            self.policy_net.train()
 
-        return q_values.squeeze(0).cpu().numpy()
+        return (
+            q_values.squeeze(0)
+            .cpu()
+            .numpy()
+        )
 
     def remember(
         self,
@@ -818,20 +939,46 @@ class NoisyDQNAgent:
     ):
         self.replay_buffer.add(
             Transition(
-                state=state.copy(),
-                action=action,
-                reward=reward,
-                next_state=next_state.copy(),
-                terminated=terminated,
-                next_mask=next_mask.copy(),
+                state=np.asarray(
+                    state,
+                    dtype=np.float32,
+                ).copy(),
+
+                action=int(action),
+                reward=float(reward),
+
+                next_state=np.asarray(
+                    next_state,
+                    dtype=np.float32,
+                ).copy(),
+
+                terminated=bool(terminated),
+
+                next_mask=np.asarray(
+                    next_mask,
+                    dtype=bool,
+                ).copy(),
             )
         )
 
-    def train_step(self, beta):
-        if len(self.replay_buffer) < max(
+    def train_step(
+        self,
+        beta,
+        warmup_steps=None,
+    ):
+        # ----------------------------------------------------
+        # FIX: configurable warm-up without global mutation
+        # ----------------------------------------------------
+
+        if warmup_steps is None:
+            warmup_steps = WARMUP_STEPS
+
+        required_samples = max(
             BATCH_SIZE,
-            WARMUP_STEPS,
-        ):
+            int(warmup_steps),
+        )
+
+        if len(self.replay_buffer) < required_samples:
             return None
 
         (
@@ -890,8 +1037,18 @@ class NoisyDQNAgent:
             device=DEVICE,
         )
 
-        # Reset online network noise for this training batch.
+        self.policy_net.train()
+        self.target_net.train()
+
+        # Sample online noise BEFORE current-Q graph.
         self.policy_net.reset_noise()
+
+        # Independent target noise.
+        self.target_net.reset_noise()
+
+        # ----------------------------------------------------
+        # CURRENT Q VALUES
+        # ----------------------------------------------------
 
         current_q_all = self.policy_net(states_t)
 
@@ -900,13 +1057,16 @@ class NoisyDQNAgent:
             actions_t.unsqueeze(1),
         ).squeeze(1)
 
-        # Double DQN target:
-        # online network chooses; target network evaluates.
-        with torch.no_grad():
-            self.policy_net.reset_noise()
-            self.target_net.reset_noise()
+        # ----------------------------------------------------
+        # DOUBLE DQN TARGET
+        # ----------------------------------------------------
 
-            online_next_q = self.policy_net(next_states_t)
+        with torch.no_grad():
+
+            # Reuse online noise. Do not reset it here.
+            online_next_q = self.policy_net(
+                next_states_t
+            )
 
             online_next_q = online_next_q.masked_fill(
                 ~next_masks_t,
@@ -918,7 +1078,9 @@ class NoisyDQNAgent:
                 keepdim=True,
             )
 
-            target_next_q = self.target_net(next_states_t)
+            target_next_q = self.target_net(
+                next_states_t
+            )
 
             selected_next_q = target_next_q.gather(
                 1,
@@ -934,17 +1096,26 @@ class NoisyDQNAgent:
 
         td_errors = targets - current_q
 
-        individual_loss = nn.functional.smooth_l1_loss(
-            current_q,
-            targets,
-            reduction="none",
+        individual_loss = (
+            nn.functional.smooth_l1_loss(
+                current_q,
+                targets,
+                reduction="none",
+            )
         )
 
         loss = (
             weights_t * individual_loss
         ).mean()
 
-        self.optimizer.zero_grad()
+        # ----------------------------------------------------
+        # BACKPROPAGATION
+        # ----------------------------------------------------
+
+        self.optimizer.zero_grad(
+            set_to_none=True
+        )
+
         loss.backward()
 
         nn.utils.clip_grad_norm_(
@@ -953,6 +1124,8 @@ class NoisyDQNAgent:
         )
 
         self.optimizer.step()
+
+        # Noise buffers are not reset until the next update.
 
         self.replay_buffer.update_priorities(
             indices,
@@ -973,7 +1146,12 @@ class NoisyDQNAgent:
         self.loss_history.append(loss_value)
 
         self.td_error_history.append(
-            float(td_errors.detach().abs().mean().item())
+            float(
+                td_errors.detach()
+                .abs()
+                .mean()
+                .item()
+            )
         )
 
         return loss_value
@@ -983,15 +1161,72 @@ class NoisyDQNAgent:
             self.policy_net.state_dict()
         )
 
-    def save(self, filename="noisy_dqn.pth"):
+    def save(self, filename=CHECKPOINT_PATH):
+        checkpoint = {
+            "policy_net": self.policy_net.state_dict(),
+            "target_net": self.target_net.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "training_steps": self.training_steps,
+            "loss_history": self.loss_history,
+            "td_error_history": self.td_error_history,
+        }
+
         torch.save(
-            {
-                "policy_net": self.policy_net.state_dict(),
-                "target_net": self.target_net.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
-                "training_steps": self.training_steps,
-            },
+            checkpoint,
             filename,
+        )
+
+    def load(self, filename=CHECKPOINT_PATH):
+        if not os.path.exists(filename):
+            raise FileNotFoundError(filename)
+
+        try:
+            checkpoint = torch.load(
+                filename,
+                map_location=DEVICE,
+                weights_only=False,
+            )
+        except TypeError:
+            checkpoint = torch.load(
+                filename,
+                map_location=DEVICE,
+            )
+
+        self.policy_net.load_state_dict(
+            checkpoint["policy_net"]
+        )
+
+        self.target_net.load_state_dict(
+            checkpoint["target_net"]
+        )
+
+        if "optimizer" in checkpoint:
+            self.optimizer.load_state_dict(
+                checkpoint["optimizer"]
+            )
+
+        self.training_steps = checkpoint.get(
+            "training_steps",
+            0,
+        )
+
+        self.loss_history = checkpoint.get(
+            "loss_history",
+            [],
+        )
+
+        self.td_error_history = checkpoint.get(
+            "td_error_history",
+            [],
+        )
+
+        self.policy_net.train()
+        self.target_net.train()
+
+        self.reset_noise()
+
+        print(
+            f"Checkpoint loaded: {filename}"
         )
 
 
@@ -1005,9 +1240,14 @@ def choose_action(q_values, mask):
     if len(valid_actions) == 0:
         return 8
 
+    valid_q = q_values[valid_actions]
+
+    if not np.all(np.isfinite(valid_q)):
+        return int(valid_actions[-1])
+
     return int(
         valid_actions[
-            np.argmax(q_values[valid_actions])
+            np.argmax(valid_q)
         ]
     )
 
@@ -1023,7 +1263,10 @@ def choose_stable_action(
     if len(valid_actions) == 0:
         return 8
 
-    best_action = choose_action(q_values, mask)
+    best_action = choose_action(
+        q_values,
+        mask,
+    )
 
     if (
         previous_action in valid_actions
@@ -1043,7 +1286,11 @@ def choose_stable_action(
 # STEP 10 — TRAINING
 # ============================================================
 
-def train_agent(agent, env, episodes=TRAIN_EPISODES):
+def train_agent(
+    agent,
+    env,
+    episodes=TRAIN_EPISODES,
+):
     global_step = 0
 
     rewards_history = []
@@ -1064,7 +1311,6 @@ def train_agent(agent, env, episodes=TRAIN_EPISODES):
     for episode in range(episodes):
         state = env.reset()
 
-        # New parameter noise at the start of each episode.
         agent.reset_noise()
 
         total_reward = 0.0
@@ -1073,8 +1319,8 @@ def train_agent(agent, env, episodes=TRAIN_EPISODES):
         for _ in range(MAX_EPISODE_STEPS):
             mask = env.action_mask()
 
-            # No epsilon-greedy random action.
-            # Exploration comes from noisy parameters.
+            # Deterministic evaluation action selection.
+            # Noisy parameter exploration occurs in training updates.
             q_values = agent.predict(state)
 
             action = choose_action(
@@ -1106,7 +1352,10 @@ def train_agent(agent, env, episodes=TRAIN_EPISODES):
             total_reward += result.reward
             global_step += 1
 
-            if result.terminated or result.truncated:
+            if (
+                result.terminated
+                or result.truncated
+            ):
                 break
 
         rewards_history.append(total_reward)
@@ -1119,8 +1368,14 @@ def train_agent(agent, env, episodes=TRAIN_EPISODES):
             else 0.0
         )
 
-        if (episode + 1) % 25 == 0 or episode == 0:
-            start = max(0, episode - 24)
+        if (
+            (episode + 1) % 25 == 0
+            or episode == 0
+        ):
+            start = max(
+                0,
+                episode - 24,
+            )
 
             avg_reward = np.mean(
                 rewards_history[start:episode + 1]
@@ -1140,7 +1395,8 @@ def train_agent(agent, env, episodes=TRAIN_EPISODES):
                 f"Success {success_rate * 100:5.1f}% | "
                 f"Collision {collision_rate * 100:5.1f}% | "
                 f"Beta {beta_by_step(global_step):.3f} | "
-                f"Priority {agent.replay_buffer.mean_priority():.4f}"
+                f"Priority "
+                f"{agent.replay_buffer.mean_priority():.4f}"
             )
 
     agent.update_target_network()
@@ -1158,7 +1414,7 @@ def train_agent(agent, env, episodes=TRAIN_EPISODES):
 
 
 # ============================================================
-# STEP 11 — PYGAME ROCKET VISUALIZATION
+# STEP 11 — PYGAME VISUALIZATION
 # ============================================================
 
 class RocketGUI:
@@ -1176,8 +1432,16 @@ class RocketGUI:
 
         self.clock = pygame.time.Clock()
 
-        self.font = pygame.font.SysFont("consolas", 16)
-        self.small_font = pygame.font.SysFont("consolas", 13)
+        self.font = pygame.font.SysFont(
+            "consolas",
+            16,
+        )
+
+        self.small_font = pygame.font.SysFont(
+            "consolas",
+            13,
+        )
+
         self.title_font = pygame.font.SysFont(
             "consolas",
             20,
@@ -1241,11 +1505,18 @@ class RocketGUI:
             return
 
         if not is_safe_position(target):
-            self.status = "TARGET TOO CLOSE TO OBSTACLE"
+            self.status = (
+                "TARGET TOO CLOSE TO OBSTACLE"
+            )
             return
 
-        if distance(target, self.env.position) < 20:
-            self.status = "TARGET TOO CLOSE TO ROCKET"
+        if distance(
+            target,
+            self.env.position,
+        ) < 20:
+            self.status = (
+                "TARGET TOO CLOSE TO ROCKET"
+            )
             return
 
         self.env.target = target
@@ -1279,16 +1550,30 @@ class RocketGUI:
             color,
         )
 
-        self.screen.blit(surface, (x, y))
+        # Pygame blit requires integer-compatible coordinates.
+        # Convert Python floats and NumPy float32/float64 safely.
+        x = int(round(float(x)))
+        y = int(round(float(y)))
+
+        self.screen.blit(
+            surface,
+            (x, y),
+        )
 
     def draw_rocket(self, x, y):
-        vector = ACTION_VECTORS[self.current_action]
+        vector = ACTION_VECTORS[
+            self.current_action
+        ]
 
         if np.linalg.norm(vector) < 0.01:
-            vector = ACTION_VECTORS[self.previous_action]
+            vector = ACTION_VECTORS[
+                self.previous_action
+            ]
 
         if np.linalg.norm(vector) < 0.01:
-            vector = np.array([1.0, 0.0])
+            vector = np.array(
+                [1.0, 0.0]
+            )
 
         angle = math.atan2(
             vector[1],
@@ -1318,14 +1603,20 @@ class RocketGUI:
                 + ly * math.cos(angle)
             )
 
-            return int(x + rx), int(y + ry)
+            return (
+                int(x + rx),
+                int(y + ry),
+            )
 
         rocket_points = [
             rotate(point)
             for point in local_points
         ]
 
-        flame_length = random.randint(9, 16)
+        flame_length = random.randint(
+            9,
+            16,
+        )
 
         flame_points = [
             rotate((-13, -4)),
@@ -1380,15 +1671,26 @@ class RocketGUI:
         )
 
     def draw_world(self):
-        self.screen.fill((18, 22, 30))
+        self.screen.fill(
+            (18, 22, 30)
+        )
 
         pygame.draw.rect(
             self.screen,
             (28, 34, 44),
-            (0, 0, WORLD_WIDTH, WORLD_HEIGHT),
+            (
+                0,
+                0,
+                WORLD_WIDTH,
+                WORLD_HEIGHT,
+            ),
         )
 
-        for x in range(0, WORLD_WIDTH, 40):
+        for x in range(
+            0,
+            WORLD_WIDTH,
+            40,
+        ):
             pygame.draw.line(
                 self.screen,
                 (39, 46, 58),
@@ -1396,7 +1698,11 @@ class RocketGUI:
                 (x, WORLD_HEIGHT),
             )
 
-        for y in range(0, WORLD_HEIGHT, 40):
+        for y in range(
+            0,
+            WORLD_HEIGHT,
+            40,
+        ):
             pygame.draw.line(
                 self.screen,
                 (39, 46, 58),
@@ -1404,7 +1710,9 @@ class RocketGUI:
                 (WORLD_WIDTH, y),
             )
 
-        center = tuple(OBSTACLE.astype(int))
+        center = tuple(
+            OBSTACLE.astype(int)
+        )
 
         pygame.draw.circle(
             self.screen,
@@ -1495,7 +1803,10 @@ class RocketGUI:
         else:
             low, high = -1.0, 1.0
 
-        span = max(high - low, 1e-6)
+        span = max(
+            high - low,
+            1e-6,
+        )
 
         for i, name in enumerate(ACTION_NAMES):
             y = y0 + 32 + i * 25
@@ -1531,14 +1842,21 @@ class RocketGUI:
             if valid:
                 width = int(
                     90
-                    * (self.q_values[i] - low)
+                    * (
+                        self.q_values[i] - low
+                    )
                     / span
                 )
 
                 pygame.draw.rect(
                     self.screen,
                     (60, 120, 190),
-                    (x0 + 205, y + 3, width, 10),
+                    (
+                        x0 + 205,
+                        y + 3,
+                        width,
+                        10,
+                    ),
                 )
 
     def draw_reward_curve(self):
@@ -1559,11 +1877,18 @@ class RocketGUI:
         pygame.draw.rect(
             self.screen,
             (50, 60, 75),
-            (x0, y0, width, height),
+            (
+                x0,
+                y0,
+                width,
+                height,
+            ),
             1,
         )
 
-        rewards = self.results["episode_rewards"]
+        rewards = self.results[
+            "episode_rewards"
+        ]
 
         if len(rewards) < 2:
             return
@@ -1572,21 +1897,28 @@ class RocketGUI:
 
         smoothed = [
             np.mean(
-                rewards[max(0, i - window + 1):i + 1]
+                rewards[
+                    max(0, i - window + 1):i + 1
+                ]
             )
             for i in range(len(rewards))
         ]
 
         low = float(min(smoothed))
         high = float(max(smoothed))
-        span = max(high - low, 1e-6)
+        span = max(
+            high - low,
+            1e-6,
+        )
 
         points = []
 
         for i, value in enumerate(smoothed):
             px = x0 + int(
-                i / max(len(smoothed) - 1, 1)
-                * width
+                i / max(
+                    len(smoothed) - 1,
+                    1,
+                ) * width
             )
 
             py = y0 + height - int(
@@ -1594,7 +1926,9 @@ class RocketGUI:
                 * (height - 6)
             )
 
-            points.append((px, py))
+            points.append(
+                (px, py)
+            )
 
         if len(points) > 1:
             pygame.draw.lines(
@@ -1702,6 +2036,13 @@ class RocketGUI:
             font=self.small_font,
         )
 
+        self.draw_text(
+            "+/-: SPEED | N: RESET NOISE | ESC: EXIT",
+            720,
+            605,
+            font=self.small_font,
+        )
+
     def simulation_step(self):
         self.mask = self.env.action_mask()
 
@@ -1715,7 +2056,9 @@ class RocketGUI:
             self.previous_action,
         )
 
-        result = self.env.step(self.current_action)
+        result = self.env.step(
+            self.current_action
+        )
 
         self.previous_action = self.current_action
 
@@ -1733,10 +2076,12 @@ class RocketGUI:
     def run(self):
         while self.running:
             for event in pygame.event.get():
+
                 if event.type == pygame.QUIT:
                     self.running = False
 
                 elif event.type == pygame.KEYDOWN:
+
                     if event.key == pygame.K_ESCAPE:
                         self.running = False
 
@@ -1770,11 +2115,13 @@ class RocketGUI:
                         )
 
                 elif event.type == pygame.MOUSEBUTTONDOWN:
+
                     if event.button == 1:
                         self.set_target(event.pos)
 
             if not self.paused:
                 for _ in range(self.speed):
+
                     if (
                         self.env.success
                         or self.env.collision
@@ -1821,19 +2168,32 @@ def run_tests():
     print("=" * 70)
 
     passed = 0
+    total = 0
 
     def check(name, condition):
-        nonlocal passed
+        nonlocal passed, total
 
-        assert condition, f"FAILED: {name}"
+        total += 1
+
+        assert bool(condition), (
+            f"FAILED: {name}"
+        )
 
         passed += 1
+
         print(f"[PASS] {name}")
 
-    # Test 1 — Layer output dimensions.
-    layer = NoisyLinear(10, 32)
+    # Test 1.
+    layer = NoisyLinear(
+        10,
+        32,
+    ).to(DEVICE)
 
-    x = torch.randn(4, 10)
+    x = torch.randn(
+        4,
+        10,
+        device=DEVICE,
+    )
 
     y = layer(x)
 
@@ -1842,7 +2202,7 @@ def run_tests():
         tuple(y.shape) == (4, 32),
     )
 
-    # Test 2 — Noise reset changes noise parameters.
+    # Test 2.
     layer.reset_noise()
     epsilon_before = layer.weight_epsilon.clone()
 
@@ -1857,45 +2217,68 @@ def run_tests():
         ),
     )
 
-    # Test 3 — Noise scale is trainable.
+    # Test 3.
     check(
         "Weight noise scale is trainable",
         layer.weight_sigma.requires_grad,
     )
 
-    # Test 4 — Bias noise scale is trainable.
+    # Test 4.
     check(
         "Bias noise scale is trainable",
         layer.bias_sigma.requires_grad,
     )
 
-    # Test 5 — Gradients propagate.
-    layer.zero_grad()
+    # Test 5.
+    layer.train()
+    layer.zero_grad(set_to_none=True)
+    layer.reset_noise()
 
-    output = layer(torch.randn(4, 10))
-    loss = output.square().mean()
-    loss.backward()
+    output = layer(
+        torch.randn(
+            4,
+            10,
+            device=DEVICE,
+        )
+    )
+
+    output.square().mean().backward()
 
     check(
-        "Gradient reaches noise scale",
+        "Gradient reaches weight noise scale",
         layer.weight_sigma.grad is not None,
     )
 
-    # Test 6 — Deterministic evaluation.
+    # Test 6.
+    check(
+        "Gradient reaches bias noise scale",
+        layer.bias_sigma.grad is not None,
+    )
+
+    # Test 7.
     layer.eval()
 
-    x_eval = torch.randn(3, 10)
+    x_eval = torch.randn(
+        3,
+        10,
+        device=DEVICE,
+    )
 
     output1 = layer(x_eval)
+
     layer.reset_noise()
+
     output2 = layer(x_eval)
 
     check(
         "Evaluation output ignores sampled noise",
-        torch.allclose(output1, output2),
+        torch.allclose(
+            output1,
+            output2,
+        ),
     )
 
-    # Test 7 — Dueling network output dimensions.
+    # Test 8.
     network = NoisyDuelingDQN().to(DEVICE)
 
     state = torch.randn(
@@ -1911,16 +2294,24 @@ def run_tests():
         tuple(q.shape) == (2, NUM_ACTIONS),
     )
 
-    # Test 8 — Dueling aggregation identity.
-    value = torch.tensor([[2.0]])
+    # Test 9.
+    value = torch.tensor(
+        [[2.0]],
+        device=DEVICE,
+    )
+
     advantage = torch.tensor(
-        [[1.0, 2.0, 3.0]]
+        [[1.0, 2.0, 3.0]],
+        device=DEVICE,
     )
 
     q_values = (
         value
         + advantage
-        - advantage.mean(dim=1, keepdim=True)
+        - advantage.mean(
+            dim=1,
+            keepdim=True,
+        )
     )
 
     check(
@@ -1931,7 +2322,7 @@ def run_tests():
         ).item(),
     )
 
-    # Test 9 — Beta schedule start.
+    # Test 10.
     check(
         "PER beta begins at 0.4",
         np.isclose(
@@ -1940,7 +2331,7 @@ def run_tests():
         ),
     )
 
-    # Test 10 — Beta schedule end.
+    # Test 11.
     check(
         "PER beta reaches 1.0",
         np.isclose(
@@ -1949,29 +2340,41 @@ def run_tests():
         ),
     )
 
-    # Test 11 — Replay sampling.
+    # Test 12.
     replay = PrioritizedReplayBuffer(20)
 
     transition = Transition(
-        state=np.zeros(STATE_SIZE, dtype=np.float32),
+        state=np.zeros(
+            STATE_SIZE,
+            dtype=np.float32,
+        ),
         action=0,
         reward=1.0,
-        next_state=np.ones(STATE_SIZE, dtype=np.float32),
+        next_state=np.ones(
+            STATE_SIZE,
+            dtype=np.float32,
+        ),
         terminated=False,
-        next_mask=np.ones(NUM_ACTIONS, dtype=bool),
+        next_mask=np.ones(
+            NUM_ACTIONS,
+            dtype=bool,
+        ),
     )
 
     for _ in range(10):
         replay.add(transition)
 
-    sample = replay.sample(4, beta=0.4)
+    sample = replay.sample(
+        4,
+        beta=0.4,
+    )
 
     check(
         "PER returns correct batch dimensions",
         sample[0].shape == (4, STATE_SIZE),
     )
 
-    # Test 12 — Probability normalization.
+    # Test 13.
     check(
         "PER probabilities sum to one",
         np.isclose(
@@ -1980,7 +2383,7 @@ def run_tests():
         ),
     )
 
-    # Test 13 — Priority update.
+    # Test 14.
     replay.update_priorities(
         np.array([0, 1]),
         np.array([2.0, 5.0]),
@@ -1991,9 +2394,8 @@ def run_tests():
         replay.priorities[1] > replay.priorities[0],
     )
 
-    # Test 14 — Environment state dimensions.
+    # Test 15.
     env = RocketNavigationEnv()
-
     state = env.reset()
 
     check(
@@ -2001,7 +2403,7 @@ def run_tests():
         state.shape == (STATE_SIZE,),
     )
 
-    # Test 15 — Safety mask.
+    # Test 16.
     mask = env.action_mask()
 
     check(
@@ -2009,13 +2411,13 @@ def run_tests():
         mask.shape == (NUM_ACTIONS,),
     )
 
-    # Test 16 — Stay action.
+    # Test 17.
     check(
         "Stay action is available",
         bool(mask[8]),
     )
 
-    # Test 17 — Action vectors.
+    # Test 18.
     norms = np.linalg.norm(
         ACTION_VECTORS[:8],
         axis=1,
@@ -2023,19 +2425,41 @@ def run_tests():
 
     check(
         "Directional actions are normalized",
-        np.allclose(norms, np.ones(8)),
+        np.allclose(
+            norms,
+            np.ones(8),
+        ),
     )
 
-    # Test 18 — Action selection respects mask.
+    # Test 19.
     test_mask = np.array(
-        [False, True, False, False, False,
-         False, False, False, True],
+        [
+            False,
+            True,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+        ],
         dtype=bool,
     )
 
     selected = choose_action(
         np.array(
-            [100, 1, 100, 100, 100, 100, 100, 100, 0],
+            [
+                100,
+                1,
+                100,
+                100,
+                100,
+                100,
+                100,
+                100,
+                0,
+            ],
             dtype=np.float32,
         ),
         test_mask,
@@ -2046,9 +2470,98 @@ def run_tests():
         selected == 1,
     )
 
+    # Test 20.
+    agent = NoisyDQNAgent()
+
+    check(
+        "Policy and target networks initialized",
+        agent.policy_net is not None
+        and agent.target_net is not None,
+    )
+
+    # Test 21.
+    check(
+        "Target network starts synchronized",
+        all(
+            torch.equal(a, b)
+            for a, b in zip(
+                agent.policy_net.parameters(),
+                agent.target_net.parameters(),
+            )
+        ),
+    )
+
+    # Test 22.
+    check(
+        "Replay buffer starts empty",
+        len(agent.replay_buffer) == 0,
+    )
+
+    # Test 23.
+    state = env.reset()
+
+    check(
+        "Environment returns finite state",
+        np.all(np.isfinite(state)),
+    )
+
+    # Test 24.
+    check(
+        "Environment action mask has valid action",
+        bool(np.any(env.action_mask())),
+    )
+
+    # Test 25 — CRITICAL REGRESSION TEST.
+    #
+    # No global variable mutation.
+    # No global declaration.
+    # Explicitly pass warmup_steps to train_step().
+
+    regression_agent = NoisyDQNAgent()
+
+    regression_agent.replay_buffer = (
+        PrioritizedReplayBuffer(
+            capacity=100,
+        )
+    )
+
+    for _ in range(BATCH_SIZE):
+        regression_agent.remember(
+            np.zeros(
+                STATE_SIZE,
+                dtype=np.float32,
+            ),
+            8,
+            0.1,
+            np.ones(
+                STATE_SIZE,
+                dtype=np.float32,
+            ),
+            False,
+            np.ones(
+                NUM_ACTIONS,
+                dtype=bool,
+            ),
+        )
+
+    regression_loss = regression_agent.train_step(
+        beta=0.4,
+        warmup_steps=BATCH_SIZE,
+    )
+
+    check(
+        "Backward pass completes without in-place noise error",
+        regression_loss is not None
+        and np.isfinite(regression_loss),
+    )
+
     print("-" * 70)
-    print(f"Tests passed: {passed}/18")
+    print(
+        f"Tests passed: {passed}/{total}"
+    )
     print("=" * 70)
+
+    return passed == total
 
 
 # ============================================================
@@ -2056,22 +2569,106 @@ def run_tests():
 # ============================================================
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Phase 4.6 — Noisy Network DQN"
+    )
+
+    parser.add_argument(
+        "--test-only",
+        action="store_true",
+        help="Run unit tests and exit.",
+    )
+
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Use fewer training episodes.",
+    )
+
+    parser.add_argument(
+        "--no-pygame",
+        action="store_true",
+        help="Train without opening Pygame.",
+    )
+
+    parser.add_argument(
+        "--load",
+        action="store_true",
+        help="Load an existing checkpoint before training.",
+    )
+
+    parser.add_argument(
+        "--skip-training",
+        action="store_true",
+        help="Load a checkpoint and launch visualization.",
+    )
+
+    args = parser.parse_args()
+
     set_seed()
 
-    run_tests()
+    print("=" * 70)
+    print("PHASE 4.6 — NOISY NETWORKS FOR DEEP RL")
+    print("=" * 70)
+    print(f"PyTorch device: {DEVICE}")
+    print("=" * 70)
+
+    tests_ok = run_tests()
+
+    if not tests_ok:
+        raise RuntimeError(
+            "Unit tests failed. Training aborted."
+        )
+
+    if args.test_only:
+        print("\nTest-only mode complete.")
+        return
 
     env = RocketNavigationEnv()
     agent = NoisyDQNAgent()
 
-    results = train_agent(
-        agent,
-        env,
-        episodes=TRAIN_EPISODES,
-    )
+    if args.load or args.skip_training:
+        if os.path.exists(CHECKPOINT_PATH):
+            agent.load(CHECKPOINT_PATH)
 
-    agent.save("noisy_dqn.pth")
+        elif args.skip_training:
+            raise FileNotFoundError(
+                f"Cannot skip training: "
+                f"{CHECKPOINT_PATH} not found."
+            )
 
-    print("\nModel saved: noisy_dqn.pth")
+    if args.skip_training:
+        results = {
+            "episode_rewards": [],
+            "success_history": [],
+            "collision_history": [],
+            "episode_losses": [],
+        }
+
+    else:
+        episodes = (
+            25
+            if args.fast
+            else TRAIN_EPISODES
+        )
+
+        results = train_agent(
+            agent,
+            env,
+            episodes=episodes,
+        )
+
+        agent.save(CHECKPOINT_PATH)
+
+        print(
+            f"\nModel saved: {CHECKPOINT_PATH}"
+        )
+
+    if args.no_pygame:
+        print(
+            "\nPygame disabled. Exiting after training."
+        )
+        return
 
     gui = RocketGUI(
         env,

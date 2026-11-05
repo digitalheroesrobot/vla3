@@ -1079,11 +1079,40 @@ class RocketGUI:
         color=(230, 230, 230),
         font=None,
     ):
+        """
+        Safely render text using Pygame.
+
+        Fix:
+            Convert NumPy floating-point coordinates,
+            Python floats, and integer coordinates into
+            valid Pygame integer destination coordinates.
+        """
+
         if font is None:
             font = self.font
 
-        surface = font.render(str(message), True, color)
-        self.screen.blit(surface, (x, y))
+        # Convert coordinates to finite Python integers.
+        x = float(x)
+        y = float(y)
+
+        if not math.isfinite(x) or not math.isfinite(y):
+            return
+
+        x = int(round(x))
+        y = int(round(y))
+
+        # Render text.
+        surface = font.render(
+            str(message),
+            True,
+            color,
+        )
+
+        # Explicitly use integer coordinates.
+        self.screen.blit(
+            surface,
+            (x, y),
+        )
 
     def draw_rocket(self, x, y):
         """
